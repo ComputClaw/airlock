@@ -6,8 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
 from airlock.api.admin import router as admin_router
 from airlock.api.agent import router as agent_router, set_worker_manager
@@ -16,7 +15,7 @@ from airlock.db import close_db, init_db
 
 logger = logging.getLogger(__name__)
 
-STATIC_DIR = Path(__file__).resolve().parent.parent.parent / "static"
+UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
 
 
 @asynccontextmanager
@@ -65,12 +64,16 @@ def create_app() -> FastAPI:
     app.include_router(agent_router)
     app.include_router(admin_router)
 
-    if STATIC_DIR.is_dir():
-        app.mount("/ui", StaticFiles(directory=str(STATIC_DIR), html=True), name="ui")
-
-    @app.get("/")
-    async def root():
-        """Redirect root to web UI."""
-        return RedirectResponse(url="/ui/")
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str) -> FileResponse:
+        """Serve the Svelte SPA — static files or index.html for client-side routing."""
+        if UI_DIR.is_dir():
+            file_path = UI_DIR / full_path
+            if file_path.is_file() and file_path.resolve().is_relative_to(UI_DIR.resolve()):
+                return FileResponse(file_path)
+            index = UI_DIR / "index.html"
+            if index.is_file():
+                return FileResponse(index)
+        return FileResponse(UI_DIR / "index.html")
 
     return app

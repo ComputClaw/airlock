@@ -9,3 +9,4 @@ dist/
 build/
 data/
 .venv/
+node_modules/
