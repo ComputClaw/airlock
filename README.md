@@ -2,15 +2,25 @@
 
 **A trust boundary between AI agents and infrastructure.**
 
-Airlock lets AI agents execute deterministic Python code against authenticated APIs — without ever seeing the credentials. The agent writes code, Airlock runs it in an isolated worker with injected secrets, and returns sanitized results.
-
 **Website:** [airlock.sh](https://airlock.sh)
 
-## Core Principle: Deterministic Execution
+## The Problem
 
-> **Same code + same source data = same numbers. Every time.**
+AI agents are great at reasoning. They're terrible at holding secrets and doing math.
 
-All data fetching, aggregation, calculation, and report building is deterministic Python. LLM is optional and only used for presentation — summaries, conclusions, insights. The data in any report is always deterministic. The AI adds interpretation, not randomness.
+**No serious company gives production credentials to an LLM.** Think about what that actually means: your Stripe API key, your database connection string, your Oracle auth token — flowing through model context windows, sitting in plaintext logs, one prompt injection away from exfiltration. The LLM hallucinates a weird API call? Congratulations, your production key is now in an error message somewhere. Compliance teams shut this down on sight, and they're right to. It's a non-starter for any real enterprise work.
+
+**Non-deterministic workflows don't work in business.** Your CFO asks "why is this number different from yesterday?" and you can't say "the AI felt different today." But that's exactly what happens when you put an LLM in the execution loop. It decides to parse the date differently. It rounds a number. It skips a row because it "seemed like a duplicate." Reports, pipelines, monitoring — they need to produce the same output given the same input. Every time. No exceptions. The moment you let an LLM make decisions about data, you lose that guarantee.
+
+These aren't edge cases. They're the two walls that every AI-in-the-enterprise project hits.
+
+## The Solution
+
+Airlock solves both problems at once.
+
+**Credentials stay in a trusted environment the agent can't see.** The agent gets an opaque profile ID. Airlock resolves that to real credentials at runtime, injects them into the execution environment, and scrubs them from the output before anything goes back. The agent never sees, touches, or transmits a single secret.
+
+**Execution is deterministic Python — not an LLM guessing its way through API calls.** The agent writes real code. `httpx.get()`, `pandas.DataFrame()`, actual Python that does exactly what it says. Same code, same data, same numbers. If you want the AI to write a summary or add insights, it does that *at the end* — interpretation on top of deterministic data, not randomness in the middle of the pipeline.
 
 ## How It Works
 
