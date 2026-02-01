@@ -19,11 +19,16 @@ Read these first:
 ## Architecture Summary
 
 - **Single Container**: Everything runs in one Docker image on port 9090. Web UI + Agent API + Execution Engine.
-- **Web UI**: Credential management, profile creation, execution history, stats. Served as static files from FastAPI.
-- **Profiles**: The key innovation. Users create profiles in the web UI → each profile gets an `ark_` ID → agents use the profile ID as auth. Profile maps to a subset of stored credentials.
-- **Agent API**: Minimal — `POST /execute`, `GET /executions/{id}`, `POST /executions/{id}/respond`, `GET /skill.md`.
+- **Web UI**: Credential value management, profile locking, execution history, stats. Served as static files from FastAPI.
+- **Credentials**: Global shared store. Both agents and users can create credential slots (name + description). Only users can set/edit values (via web UI). Updating a value propagates to all profiles referencing that credential.
+- **Profiles**: The key innovation. Two states: **unlocked** (setup) → **locked** (production). Both agents and users can create profiles and add/remove credential references while unlocked. Only users can lock profiles (via web UI). Locked profiles can be used for execution. Each profile gets an `ark_` ID that agents use as auth.
+- **Agent API**:
+  - Credentials: `GET /credentials` (list all + `value_exists`), `POST /credentials` (create slots, no values)
+  - Profiles: `GET /profiles`, `GET /profiles/{id}`, `POST /profiles`, `POST /profiles/{id}/credentials`, `DELETE /profiles/{id}/credentials`
+  - Execution: `POST /execute` (returns `poll_url`), `GET /executions/{id}`, `POST /executions/{id}/respond`
+  - Discovery: `GET /skill.md`
 - **Two-Layer SKILL.md**: Static (GitHub/airlock.sh) for discovery + Dynamic (`GET /skill.md`) for self-onboarding.
-- **Polling API**: Agent POSTs code → 202 with execution_id → polls GET /executions/{id} → gets result. No webhooks.
+- **Polling API**: Agent POSTs code → 202 with execution_id + poll_url → polls poll_url → gets result. Always use `poll_url` (load-balancer safe). No webhooks.
 - **LLM via Polling**: Scripts can call `llm.complete()` which pauses execution. Agent sees `awaiting_llm` status, provides response via POST. Airlock holds zero LLM credentials.
 
 ## Tech Stack
@@ -92,13 +97,17 @@ airlock/
 
 - **Profile IDs are auth** — `ark_` + random string. No separate API keys or tokens for agents.
 - **Credentials stored encrypted** — Fernet symmetric encryption in SQLite
+- **Credentials are shared** — one credential can be referenced by many profiles. Update once, all profiles get it.
+- **Agents create structure, users provide secrets** — agents can create credential slots and profiles, but only users set values and lock profiles.
+- **Profile states: unlocked → locked** — one-way transition. Keys can only be added/removed while unlocked. Only locked profiles can execute.
 - **Admin token on first boot** — printed to console, used to login to web UI
 - **Secrets are NEVER logged, NEVER returned in responses** — redacted as `[REDACTED...last4]`
 - **Single port (9090)** — web UI and agent API on the same port
 - **SQLite, not YAML** — all state in SQLite (credentials, profiles, executions)
-- **Polling, not callbacks** — agent polls for status, no webhooks needed
+- **Polling, not callbacks** — agent polls for status, no webhooks needed. POST /execute returns `poll_url` for load-balancer affinity.
 - **LLM credentials stay on the agent side** — Airlock is purely an execution service
 - **Output sanitization runs BEFORE any response is sent**
+- **DB export/import is UI-only** — no API endpoints for moving credential databases. Human in the loop.
 
 ## Script SDK (available inside workers)
 
@@ -116,20 +125,22 @@ set_result(data)               # Set the script's return value
 CREATE TABLE credentials (
     id TEXT PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,       -- e.g., "SIMPHONY_API_KEY"
-    encrypted_value BLOB NOT NULL,
-    description TEXT,
-    created_at TEXT,
+    encrypted_value BLOB,            -- NULL when agent creates slot without value
+    description TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT
 );
 
 -- Access profiles
 CREATE TABLE profiles (
     id TEXT PRIMARY KEY,             -- ark_... opaque ID
-    description TEXT,
+    description TEXT DEFAULT '',
+    locked INTEGER DEFAULT 0,        -- 0 = unlocked (setup), 1 = locked (production)
     expires_at TEXT,                  -- NULL = never expires
     revoked INTEGER DEFAULT 0,
-    created_at TEXT,
-    updated_at TEXT
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT,
+    last_used_at TEXT
 );
 
 -- Many-to-many: which credentials each profile can access
@@ -141,17 +152,24 @@ CREATE TABLE profile_credentials (
 
 -- Execution history
 CREATE TABLE executions (
-    id TEXT PRIMARY KEY,             -- exec_... 
+    id TEXT PRIMARY KEY,             -- exec_...
     profile_id TEXT REFERENCES profiles(id),
-    script TEXT,
-    status TEXT,                     -- pending/running/awaiting_llm/completed/error/timeout
+    script TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending/running/awaiting_llm/completed/error/timeout
     result TEXT,                     -- JSON
-    stdout TEXT,
-    stderr TEXT,
+    stdout TEXT DEFAULT '',
+    stderr TEXT DEFAULT '',
     error TEXT,
+    llm_request TEXT,               -- JSON (present when awaiting_llm)
     execution_time_ms INTEGER,
-    created_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
     completed_at TEXT
+);
+
+-- Admin settings
+CREATE TABLE admin (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 ```
 
