@@ -6,9 +6,10 @@ import tempfile
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-# Set data dir before any imports that read it
+# Set data dir and disable worker before any imports that read them
 _tmpdir = tempfile.mkdtemp()
 os.environ["AIRLOCK_DATA_DIR"] = _tmpdir
+os.environ["AIRLOCK_WORKER_ENABLED"] = "false"
 
 
 @pytest.fixture(autouse=True)
@@ -20,9 +21,10 @@ def _reset_db_module():
 
 @pytest.fixture(autouse=True)
 def _clear_executions():
-    """Clear in-memory executions between tests."""
-    from airlock.api.agent import _executions
+    """Clear in-memory executions and reset worker manager between tests."""
+    from airlock.api.agent import _executions, set_worker_manager
     _executions.clear()
+    set_worker_manager(None)
 
 
 @pytest.fixture

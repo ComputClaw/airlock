@@ -1,8 +1,12 @@
 """Agent-facing API routes: execute, poll, LLM respond, skill discovery."""
 
-import uuid
+from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+import logging
+import uuid
+from typing import TYPE_CHECKING
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import PlainTextResponse
 
 from airlock.models import (
@@ -13,32 +17,85 @@ from airlock.models import (
     LLMResponse,
 )
 
+if TYPE_CHECKING:
+    from airlock.worker_manager import WorkerManager
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
-# In-memory execution storage for mock phase
+# In-memory execution storage
 _executions: dict[str, ExecutionResult] = {}
+
+# Worker manager (set by app lifespan, None = mock mode)
+_worker_manager: WorkerManager | None = None
+
+
+def set_worker_manager(wm: WorkerManager | None) -> None:
+    """Set (or clear) the worker manager used by the execute endpoint."""
+    global _worker_manager  # noqa: PLW0603
+    _worker_manager = wm
+
+
+async def _run_execution(
+    execution_id: str, script: str, settings: dict[str, str], timeout: int
+) -> None:
+    """Background task: run script via worker or fall back to mock."""
+    _executions[execution_id] = _executions[execution_id].model_copy(
+        update={"status": ExecutionStatus.running}
+    )
+
+    try:
+        if _worker_manager is not None and _worker_manager.is_running():
+            result = await _worker_manager.execute(script, settings, timeout)
+            status = ExecutionStatus(result["status"])
+            _executions[execution_id] = _executions[execution_id].model_copy(
+                update={
+                    "status": status,
+                    "result": result.get("result"),
+                    "stdout": result.get("stdout", ""),
+                    "stderr": result.get("stderr", ""),
+                    "error": result.get("error"),
+                }
+            )
+        else:
+            # Mock fallback: echo the script
+            _executions[execution_id] = _executions[execution_id].model_copy(
+                update={
+                    "status": ExecutionStatus.completed,
+                    "result": {"echo": script[:100]},
+                }
+            )
+    except Exception as exc:
+        logger.exception("Execution %s failed", execution_id)
+        _executions[execution_id] = _executions[execution_id].model_copy(
+            update={
+                "status": ExecutionStatus.error,
+                "error": str(exc),
+            }
+        )
 
 
 @router.post("/execute", status_code=202, response_model=ExecutionCreated)
-async def execute(request: ExecutionRequest) -> ExecutionCreated:
-    """Accept a script for execution. Mock: completes immediately with echo."""
+async def execute(request: ExecutionRequest, background: BackgroundTasks) -> ExecutionCreated:
+    """Accept a script for execution. Returns 202 and runs in background."""
     if not request.profile_id.startswith("ark_"):
         raise HTTPException(status_code=401, detail="Invalid profile_id: must start with 'ark_'")
 
     execution_id = f"exec_{uuid.uuid4().hex}"
     poll_url = f"/executions/{execution_id}"
 
-    # Mock: immediately complete with echo of the script
     _executions[execution_id] = ExecutionResult(
         execution_id=execution_id,
-        status=ExecutionStatus.completed,
-        result={"echo": request.script[:100]},
+        status=ExecutionStatus.pending,
     )
+
+    background.add_task(_run_execution, execution_id, request.script, {}, request.timeout)
 
     return ExecutionCreated(
         execution_id=execution_id,
         poll_url=poll_url,
-        status=ExecutionStatus.completed,
+        status=ExecutionStatus.pending,
     )
 
 
