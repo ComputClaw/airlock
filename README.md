@@ -2,44 +2,50 @@
 
 **A trust boundary between AI agents and infrastructure.**
 
-Airlock lets AI agents execute code against authenticated APIs without ever seeing the credentials. The agent writes the code. Airlock runs it with injected secrets in a sandboxed environment. Only sanitized results come back.
+Airlock lets AI agents execute deterministic Python code against authenticated APIs — without ever seeing the credentials. The agent writes code, Airlock runs it in an isolated worker pool with injected secrets, and returns sanitized results.
 
-## The Problem
+## Core Principle: Deterministic Execution
 
-AI agents need to access data from external APIs — but giving an LLM your API keys means those credentials flow through the model provider's infrastructure, appear in conversation context, and can be leaked through prompt injection or hallucination.
+> **Same code + same source data = same numbers. Every time.**
 
-## The Solution
+All data fetching, aggregation, calculation, and report building is deterministic Python. LLM is optional and only used for presentation — summaries, conclusions, insights. The data in any report is always deterministic. The AI adds interpretation, not randomness.
+
+## How It Works
 
 ```
-Agent writes Python code
+Agent POSTs code to Airlock
         ↓
-Airlock receives code + declared dependencies
+Airlock routes to an idle worker in the project's pool
         ↓
-Secrets injected as environment variables (agent never sees them)
-        ↓
-Code runs in isolated Docker container
+Worker executes code with secrets as env vars
   - Network: allowlisted hosts only
-  - Timeout: configurable (default 60s)
-  - Memory: capped (default 512MB)
-  - Filesystem: read-only except /output
+  - Secrets: injected at container start
+  - Isolation: per-project worker pools
         ↓
-Sanitized results returned to agent
-  - stdout/stderr with secrets redacted
-  - Files from /output
+If script calls llm.complete():
+  - Execution pauses
+  - Agent sees {status: "awaiting_llm", prompt: "..."}
+  - Agent runs LLM, POSTs response back
+  - Script resumes
+        ↓
+Sanitized results returned (secrets redacted)
 ```
 
-## Key Principles
+## Architecture at a Glance
 
-1. **Secrets never touch the LLM.** They exist only inside the execution container.
-2. **Execution is deterministic.** Same code + same data = same results. The AI adds interpretation, not randomness.
-3. **Network is allowlisted.** Code can only reach declared API endpoints. No phoning home.
-4. **Containers are ephemeral.** Spun up per execution, killed after. No state leaks between runs.
-5. **Output is sanitized.** Even if code accidentally prints a secret, it gets redacted before reaching the agent.
+- **Worker Pool Model**: Per-project pools of long-running Docker containers. Warm, fast, isolated.
+- **Polling API**: Agent POSTs code → gets 202 + execution_id → polls until done. No webhooks, works behind NAT.
+- **LLM via Polling**: Scripts can request LLM completions. Airlock holds zero LLM credentials — the agent provides them.
+- **Secret Isolation**: Secrets exist only inside worker containers as env vars. Output is redacted before return.
 
-## Architecture
+## Lifecycle
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+```
+project create → project up --replicas N → requests routed → project down
+```
 
 ## Status
 
 🚧 Under construction. Built by Martin Bundgaard and Comput.
+
+See [docs/architecture.md](docs/architecture.md) for the full design.
