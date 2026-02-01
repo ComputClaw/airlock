@@ -61,17 +61,20 @@ Users manage credentials and access through a **web UI**. Agents interact throug
 
 ### Credentials (Global Store)
 
-Credentials are shared, user-managed secrets. They exist independently of profiles.
+Credentials are shared secrets that exist independently of profiles.
 
 | Property | Description |
 |----------|-------------|
 | **Name** | Unique key name (e.g., `SIMPHONY_API_KEY`) |
 | **Value** | Encrypted at rest, only decrypted at execution time |
 | **Description** | What this credential is for |
+| **value_exists** | Whether a value has been set (visible to agents) |
 
-- **Only the user** can create, edit, or delete credentials (via web UI)
-- Agents **never** see credential values — only key names
+- **Both agent and user** can create credential slots (name + description)
+- **Only the user** can set or edit credential **values** (via web UI)
+- Agents **never** see credential values — only key names + `value_exists` flag
 - Updating a credential value propagates to **all profiles** that reference it (rotate once, done)
+- Agents can always list all credentials: `GET /credentials` → names, descriptions, `value_exists`
 
 ### Profiles
 
@@ -89,18 +92,17 @@ A **profile** is scoped access to credentials. Agents create profiles, users fil
 ### Profile States: Unlocked → Locked
 
 **Unlocked** (setup phase — agent and user collaborate):
-- Agent or user can **add/remove key references**
+- Agent or user can **add/remove credential references**
 - User can **fill in credential values** for referenced keys
 - Profile **cannot be used for execution**
-- Agent can read: key names, descriptions, `value_exists` flags
 
-**Locked** (production — user activates):
-- **No structural changes** — keys cannot be added or removed
+**Locked** (production — user activates, always via web UI):
+- **No structural changes** — credentials cannot be added or removed from the profile
 - User can still **update credential values** (propagates to all profiles using that credential)
 - Profile **can be used for execution**
 - User can revoke or set expiration
 
-Keys can ONLY be added when the profile is unlocked. This applies to both agents and users.
+Credentials can ONLY be added to or removed from a profile when it is unlocked. This applies to both agents and users. Only the user can lock a profile (via web UI).
 
 ### Why This Model?
 
@@ -111,10 +113,79 @@ Keys can ONLY be added when the profile is unlocked. This applies to both agents
 - **Clear handoff** — unlocked = still setting up, locked = ready for production
 - **Auditable** — every execution tied to a specific profile
 
-### Agent API for Profiles
+### Agent API
 
-#### Create Profile
+#### Credentials
+
 ```
+# List all credentials (agent can always do this)
+GET /credentials
+
+→ 200 OK
+{
+  "credentials": [
+    {"name": "SIMPHONY_API_KEY", "description": "Simphony REST API key", "value_exists": true},
+    {"name": "OPERA_API_KEY", "description": "OPERA PMS API key", "value_exists": true},
+    {"name": "DB_HOST", "description": "Oracle DB hostname", "value_exists": false}
+  ]
+}
+
+# Create credential slots (name + description only, no value)
+POST /credentials
+{
+  "credentials": [
+    {"name": "REPORTING_DB_PASS", "description": "Read-only DB password for reporting"}
+  ]
+}
+
+→ 201 Created
+```
+
+#### Profiles
+
+```
+# List all profiles (agent can always do this)
+GET /profiles
+
+→ 200 OK
+{
+  "profiles": [
+    {
+      "profile_id": "ark_7f3x9kw2m4p",
+      "description": "Oracle reporting — read only",
+      "locked": true,
+      "credentials": [
+        {"name": "SIMPHONY_API_KEY", "value_exists": true},
+        {"name": "DB_HOST", "value_exists": true}
+      ]
+    },
+    {
+      "profile_id": "ark_9b4k2m8x1nq",
+      "description": "Analytics pipeline",
+      "locked": false,
+      "credentials": [
+        {"name": "OPERA_API_KEY", "value_exists": true},
+        {"name": "REPORTING_DB_PASS", "value_exists": false}
+      ]
+    }
+  ]
+}
+
+# Get single profile
+GET /profiles/ark_7f3x9kw2m4p
+
+→ 200 OK
+{
+  "profile_id": "ark_7f3x9kw2m4p",
+  "description": "Oracle reporting — read only",
+  "locked": true,
+  "credentials": [
+    {"name": "SIMPHONY_API_KEY", "description": "Simphony REST API key", "value_exists": true},
+    {"name": "DB_HOST", "description": "Oracle DB hostname", "value_exists": true}
+  ]
+}
+
+# Create profile
 POST /profiles
 {
   "description": "Oracle reporting — read only"
@@ -123,39 +194,25 @@ POST /profiles
 → 201 Created
 {
   "profile_id": "ark_7f3x9kw2m4p",
-  "description": "Oracle reporting — read only",
   "locked": false,
-  "keys": []
+  "credentials": []
 }
-```
 
-#### Add Keys (unlocked only)
-```
-POST /profiles/ark_7f3x9kw2m4p/keys
+# Add credentials to profile (unlocked only)
+POST /profiles/ark_7f3x9kw2m4p/credentials
 {
-  "keys": [
-    {"name": "SIMPHONY_API_KEY", "description": "Simphony REST API key"},
-    {"name": "DB_HOST", "description": "Oracle DB hostname"}
-  ]
+  "credentials": ["SIMPHONY_API_KEY", "DB_HOST"]
 }
 
 → 200 OK
-```
 
-#### Read Profile
-```
-GET /profiles/ark_7f3x9kw2m4p
+# Remove credentials from profile (unlocked only)
+DELETE /profiles/ark_7f3x9kw2m4p/credentials
+{
+  "credentials": ["DB_HOST"]
+}
 
 → 200 OK
-{
-  "profile_id": "ark_7f3x9kw2m4p",
-  "description": "Oracle reporting — read only",
-  "locked": false,
-  "keys": [
-    {"name": "SIMPHONY_API_KEY", "description": "Simphony REST API key", "value_exists": true},
-    {"name": "DB_HOST", "description": "Oracle DB hostname", "value_exists": false}
-  ]
-}
 ```
 
 #### Profile Lifecycle
