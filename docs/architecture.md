@@ -16,104 +16,229 @@ Why this matters:
 
 ## Overview
 
-Airlock is a Python code execution service that sits between AI agents and authenticated infrastructure. It accepts code from agents, runs it in isolated worker containers with injected secrets, and returns sanitized results via a polling API.
+Airlock is a Python code execution service that sits between AI agents and authenticated infrastructure. It accepts code from agents, runs it in an isolated environment with injected secrets, and returns sanitized results via a polling API.
+
+Users manage credentials and access through a **web UI**. Agents interact through a minimal **HTTP API** authenticated by **profile IDs**.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│                         AI Agent                                 │
+│                           User                                   │
 │                                                                  │
-│  1. POST /execute {code, project}         → 202 {execution_id}  │
-│  2. GET  /executions/{id}                 → {status: "running"}  │
-│  3. GET  /executions/{id}                 → {status: "awaiting_  │
-│                                               llm", prompt: ...} │
-│  4. POST /executions/{id}/respond {resp}  → 200                  │
-│  5. GET  /executions/{id}                 → {status: "completed",│
-│                                               result: ...}       │
+│  Opens web UI at http://<airlock-host>:9090                      │
+│  • Adds API credentials (stored encrypted)                       │
+│  • Creates profiles (ark_...) — scoped access to credentials     │
+│  • Sets expiration, views execution history & stats              │
 └──────────────────┬───────────────────────────────────────────────┘
-                   │ HTTPS
+                   │ Browser
 ┌──────────────────▼───────────────────────────────────────────────┐
-│                     Airlock API Server                            │
-│                     (FastAPI — router/manager)                    │
+│                     Airlock Server                                │
+│                     (FastAPI — single container)                  │
 │                                                                  │
-│  • Accepts execution requests                                    │
-│  • Routes to idle worker in the project's pool                   │
-│  • Tracks execution state (pending/running/awaiting_llm/...)     │
-│  • Returns sanitized results                                     │
-└────────┬─────────────────┬─────────────────┬─────────────────────┘
-         │                 │                 │
-    ┌────▼────┐       ┌────▼────┐       ┌────▼────┐
-    │ Worker  │       │ Worker  │       │ Worker  │    Project: "reports"
-    │  :8001  │       │  :8001  │       │  :8001  │    (3 replicas)
-    │ FastAPI │       │ FastAPI │       │ FastAPI │
-    │ /run    │       │ /run    │       │ /run    │
-    └─────────┘       └─────────┘       └─────────┘
-
-    ┌─────────┐       ┌─────────┐
-    │ Worker  │       │ Worker  │                      Project: "analytics"
-    │  :8001  │       │  :8001  │                      (2 replicas)
-    │ FastAPI │       │ FastAPI │
-    │ /run    │       │ /run    │
-    └─────────┘       └─────────┘
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
+│  │   Web UI    │  │  Agent API  │  │   Execution Engine      │  │
+│  │  (static)   │  │  /execute   │  │   Worker pool           │  │
+│  │  /ui/*      │  │  /exec/{id} │  │   Sandboxed Python      │  │
+│  │             │  │  /skill.md  │  │   Secret injection      │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐ │
+│  │                    SQLite Database                           │ │
+│  │  credentials (encrypted) | profiles | executions | stats    │ │
+│  └─────────────────────────────────────────────────────────────┘ │
+└──────────────────────────────────────────────────────────────────┘
+                   │
+                   │ Outbound HTTP (allowlisted hosts only)
+                   ▼
+            ┌──────────────┐
+            │ External APIs │
+            │ (Oracle, etc) │
+            └──────────────┘
 ```
 
 ---
 
-## Worker Pool Model
+## Profile System — The Key Innovation
 
-### Why Not Container-per-Execution?
+A **profile** is scoped access to credentials. It is the central concept that makes Airlock simple for both users and agents.
 
-Spinning up a fresh container for every code execution adds 1-3 seconds of cold-start overhead, requires rebuilding the environment each time, and wastes resources. A warm pool eliminates all of this.
+### What is a Profile?
 
-### How It Works
+| Property | Description |
+|----------|-------------|
+| **ID** | `ark_` + random string (e.g., `ark_7f3x9kw2m4p...`) |
+| **Auth** | The profile ID itself acts as the API authentication token |
+| **Credentials** | User selects which stored credentials this profile can access |
+| **Expiration** | Optional date after which the profile auto-revokes |
+| **Revocable** | Can be instantly revoked from the web UI |
 
-1. **Project Create**: User defines a project — packages, secrets, network rules
-2. **Image Build**: Airlock builds a Docker image with pre-installed packages
-3. **Pool Up**: `project up --replicas N` spins up N long-running worker containers
-4. **Request Routing**: Airlock API routes incoming `/execute` requests to an idle worker
-5. **Execution**: Worker runs code in a thread, returns results via HTTP
-6. **Pool Down**: `project down` tears down all workers for the project
+### Why Profiles?
 
-### Worker Internals
+- **Agent never sees credentials** — only the opaque `ark_` ID
+- **Scoped access** — different profiles can expose different credential subsets
+- **Permission levels** — one profile for read-only, another for admin
+- **Time-limited** — set expiration for temporary access
+- **Auditable** — every execution is tied to a specific profile
+- **Revocable** — instant revocation without rotating credentials
 
-Each worker container runs a minimal FastAPI server:
-
-```
-Worker Container
-├── FastAPI server on :8001
-│   └── POST /run
-│       ├── Receives {code, settings, memory}
-│       ├── Executes code in a thread
-│       ├── If llm.complete() called → returns {status: "awaiting_llm", ...}
-│       ├── On resume → continues execution
-│       └── Returns {status, result, stdout, stderr, memory_updates}
-├── ENV: secrets injected at container start
-├── SDK: settings, memory, llm, set_result available to scripts
-└── Runs as non-root user
-```
-
-### Pool Lifecycle
+### Profile Lifecycle
 
 ```
-project create "reports"
-  → defines packages, secrets, network rules
+User creates profile in web UI
+  → Selects credentials: [SIMPHONY_API_KEY, OPERA_API_KEY]
+  → Sets description: "Read-only reporting access"
+  → Sets expiration: 2025-06-01 (optional)
+  → Gets profile ID: ark_7f3x9kw2m4p
 
-project up "reports" --replicas 3
-  → builds image (if needed)
-  → starts 3 worker containers
-  → registers them in the routing table
+Agent uses profile ID in API calls
+  → POST /execute {profile_id: "ark_7f3x9kw2m4p", script: "..."}
+  → Airlock resolves profile → injects selected credentials → executes
 
-POST /execute {project: "reports", code: "..."}
-  → finds idle worker → forwards to worker /run
-  → tracks execution state
-
-project down "reports"
-  → stops and removes all worker containers
-  → clears routing table
+User revokes profile (optional)
+  → Profile ID immediately stops working
+  → Credentials remain intact for other profiles
 ```
 
 ---
 
-## Polling-Based API
+## Web UI
+
+Airlock ships with a web UI baked into the Docker image. When the user deploys the container and opens `http://<host>:9090` in a browser, they get a management interface.
+
+### First Boot
+
+On first boot, Airlock generates an admin token and prints it to the container console:
+
+```
+╔══════════════════════════════════════════════════╗
+║  Airlock admin token: atk_8f2k4m9x...           ║
+║  Open http://localhost:9090 to configure         ║
+╚══════════════════════════════════════════════════╝
+```
+
+### UI Sections
+
+#### Credentials
+- Add/edit/delete API credentials
+- Credentials stored **encrypted** in SQLite
+- Each credential has a name (e.g., `SIMPHONY_API_KEY`) and value
+- Optional metadata: description, associated service/host
+
+#### Profiles
+- Create profiles with unique `ark_` IDs
+- For each profile, select which credentials are visible to scripts
+- Set optional expiration date (auto-revoke after date)
+- Revoke/delete profiles at any time
+- Copy profile ID to clipboard for sharing with agents
+
+#### Execution History
+- Table of all executions: profile, timestamp, status, duration
+- Click to expand: see script code, stdout, result
+- Filter by profile, status, date range
+
+#### Stats Dashboard
+- Executions per profile (chart)
+- Error rates
+- Average execution duration
+- Active profiles count
+
+---
+
+## Two-Layer SKILL.md
+
+SKILL.md is the mechanism for agent self-onboarding.
+
+### Static SKILL.md (GitHub / airlock.sh)
+
+Lives at `https://airlock.sh/skill.md` and in the repository root. Any agent can read this before Airlock is even deployed. Contains:
+
+- What Airlock is
+- How to deploy it (Docker command, cloud one-click)
+- API reference (endpoints, request/response formats)
+- SDK reference (what functions are available inside scripts)
+
+### Dynamic `GET /skill.md` (Running Instance)
+
+Served by the running Airlock instance at `GET /skill.md`. Returns instance-specific information:
+
+- Instance URL
+- Available profiles (ID + description + expiry)
+- Which credentials each profile has access to (names only, never values)
+- SDK reference
+- Example code snippets tailored to available credentials
+
+### Self-Onboarding Flow
+
+```
+Agent reads static SKILL.md from GitHub
+  → Learns what Airlock is and how the API works
+  → Generates deploy instructions for user
+
+User deploys Airlock
+  → docker run -p 9090:9090 ghcr.io/computclaw/airlock
+  → Opens web UI, adds credentials, creates profiles
+
+Agent reads dynamic GET /skill.md from running instance
+  → Discovers available profiles and their capabilities
+  → Self-onboards without further user intervention
+
+Agent starts executing code
+  → POST /execute {profile_id: "ark_...", script: "..."}
+```
+
+---
+
+## Distribution & Deployment
+
+### Single Container
+
+Everything runs in one Docker container:
+
+```bash
+docker run -p 9090:9090 ghcr.io/computclaw/airlock:latest
+```
+
+- **Image**: `ghcr.io/computclaw/airlock:latest`
+- **Port**: 9090 (web UI + agent API on the same port)
+- **State**: SQLite database stored in a Docker volume
+- **No external dependencies**
+
+### What's Inside
+
+```
+Docker Container
+├── FastAPI server on :9090
+│   ├── /ui/*          → Web UI (static files)
+│   ├── /execute       → Agent API
+│   ├── /executions/*  → Agent API
+│   ├── /skill.md      → Dynamic skill document
+│   └── /health        → Health check
+├── Execution engine
+│   ├── Worker pool (sandboxed Python execution)
+│   └── Secret injection + output sanitization
+├── SQLite database
+│   ├── credentials (encrypted)
+│   ├── profiles
+│   ├── executions (history)
+│   └── stats
+└── Web UI static assets
+```
+
+### Persistence
+
+Mount a volume for the SQLite database:
+
+```bash
+docker run -p 9090:9090 -v airlock-data:/data ghcr.io/computclaw/airlock:latest
+```
+
+### Roadmap
+
+- **v1**: Local network only — deploy on your LAN or localhost
+- **v2**: Optional tunnel integration (ngrok/bore/cloudflare) — one toggle in the web UI to expose publicly
+
+---
+
+## Polling-Based Agent API
 
 ### Why Polling (Not Callbacks)?
 
@@ -128,7 +253,7 @@ project down "reports"
 | Status | Meaning |
 |--------|---------|
 | `pending` | Queued, waiting for idle worker |
-| `running` | Code is executing in a worker |
+| `running` | Code is executing |
 | `awaiting_llm` | Script called `llm.complete()`, waiting for agent to provide LLM response |
 | `completed` | Finished successfully |
 | `error` | Execution failed (exception, invalid code, etc.) |
@@ -138,16 +263,14 @@ project down "reports"
 
 #### `POST /execute`
 
-Submit code for execution. Returns immediately with an execution ID.
+Submit code for execution. Authenticated by profile ID.
 
 ```
 Request:
 {
-  "project": "reports",
-  "code": "import requests\ndata = requests.get(settings.get('API_URL'))...",
-  "timeout": 60,
-  "settings": {"REPORT_TYPE": "weekly"},    // non-secret settings
-  "memory": {"last_run": "2025-01-15"}      // current memory state
+  "profile_id": "ark_7f3x9kw2m4p",
+  "script": "import httpx\ndata = httpx.get(settings.get('API_URL'))...",
+  "timeout": 60
 }
 
 Response: 202 Accepted
@@ -182,12 +305,9 @@ Response (completed):
 {
   "execution_id": "exec_a1b2c3d4",
   "status": "completed",
-  "result": { ... },              // whatever set_result() was called with
-  "stdout": "...",                // sanitized
-  "stderr": "...",                // sanitized
-  "memory_updates": {             // changes to apply to memory
-    "last_run": "2025-02-01"
-  },
+  "result": { ... },
+  "stdout": "...",
+  "stderr": "...",
   "execution_time_ms": 1234
 }
 
@@ -219,56 +339,9 @@ Response: 200 OK
 }
 ```
 
-#### `GET /projects`
+#### `GET /skill.md`
 
-List available projects and their status.
-
-```
-Response:
-{
-  "projects": [
-    {
-      "name": "reports",
-      "description": "Oracle Simphony revenue reporting",
-      "status": "up",
-      "replicas": 3,
-      "idle_workers": 2,
-      "packages": ["requests", "pandas", "openpyxl"]
-    }
-  ]
-}
-```
-
-#### `POST /projects/{name}/up`
-
-Start the worker pool for a project.
-
-```
-Request:
-{
-  "replicas": 3
-}
-
-Response: 200 OK
-{
-  "name": "reports",
-  "status": "up",
-  "replicas": 3
-}
-```
-
-#### `POST /projects/{name}/down`
-
-Stop and remove all workers for a project.
-
-```
-Response: 200 OK
-{
-  "name": "reports",
-  "status": "down",
-  "replicas": 0
-}
-```
+Returns the dynamic skill document for agent self-onboarding. See [Two-Layer SKILL.md](#two-layer-skillmd).
 
 #### `GET /health`
 
@@ -338,19 +411,11 @@ These functions are available to scripts running inside workers:
 
 ### `settings.get(key) → str`
 
-Get a setting value. Secrets are resolved from environment variables (injected at container start). Non-secret settings are passed in the execution payload.
+Get a setting value. Credentials from the profile are injected and accessible by their key name. The script never sees raw values in env vars — they're resolved transparently.
 
 ### `settings.keys() → list[str]`
 
-List all available setting keys.
-
-### `memory.get(category, key) → any`
-
-Read a value from persistent memory. Memory is passed in with the execution request.
-
-### `memory.set(category, key, value)`
-
-Write a value to persistent memory. Changes are collected and returned in the execution response as `memory_updates`. They are not applied until the execution completes successfully.
+List all available setting keys for the current profile.
 
 ### `llm.complete(prompt, model="default") → str`
 
@@ -364,91 +429,66 @@ Set the structured return value of the script. `data` can be any JSON-serializab
 
 ---
 
-## Settings vs Memory
-
-| | Settings | Memory |
-|---|----------|--------|
-| **What** | User-provided configuration | Agent-learned state |
-| **Examples** | API keys, base URLs, preferences | Last run timestamp, counters, cache |
-| **Who writes** | User/admin configures | Scripts read and write |
-| **Script access** | Read-only (`settings.get`) | Read-write (`memory.get`, `memory.set`) |
-| **Conflict rule** | **Settings wins** | Memory yields |
-| **Where stored** | Project config + env vars | Execution payload + response |
-
-### How Settings Work
-
-- **Secrets** (API keys, tokens): Defined in project config, injected as environment variables at container start. `settings.get("API_KEY")` reads from `os.environ`.
-- **Non-secrets** (preferences, config): Passed in the execution request payload. `settings.get("REPORT_TYPE")` reads from the payload.
-
-### How Memory Works
-
-- Agent passes current memory state in the execution request
-- Script reads with `memory.get(category, key)`
-- Script writes with `memory.set(category, key, value)`
-- Changes are **not applied during execution** — they're returned in the response as `memory_updates`
-- The agent applies the updates to its memory store after receiving results
-
----
-
 ## Security Model
 
-### Layer 1: Secret Isolation
+### Layer 1: Profile-Based Access Control
 
-- Secrets injected as **environment variables** at container start (process-scoped)
-- Code sent via HTTP request body — never written to disk
-- Scripts access secrets through `settings.get()`, never see raw env var names
-- Agent never receives secret values — only project names and setting keys
+- Agents authenticate with opaque profile IDs (`ark_...`)
+- Each profile grants access to a specific set of credentials
+- Profiles can expire automatically
+- Profiles are instantly revocable
+- No credential values ever transmitted to agents
 
-### Layer 2: Output Sanitization
+### Layer 2: Credential Encryption
+
+- Credentials stored encrypted in SQLite
+- Decrypted only at execution time, injected into worker environment
+- Encryption key derived from instance secret (generated at first boot)
+
+### Layer 3: Output Sanitization
 
 All output is scanned before being returned to the agent:
-- Exact-match against known secret values
+- Exact-match against known credential values
 - Common patterns: API keys, bearer tokens, connection strings
 - Matches replaced with `[REDACTED...last4]` (last 4 chars preserved for debugging)
 - Applied to: stdout, stderr, result data, error messages
 
-### Layer 3: Network Isolation
+### Layer 4: Network Isolation
 
-- Each project declares an **allowlist** of hosts the code can reach
-- Workers are on a Docker network with iptables rules enforcing the allowlist
+- Each profile can declare an **allowlist** of hosts the code can reach
+- Workers are network-isolated with rules enforcing the allowlist
 - DNS resolution only for allowlisted hosts
 - No "phone home" — code can't exfiltrate data to arbitrary endpoints
 
-### Layer 4: Container Isolation
+### Layer 5: Execution Sandboxing
 
-- Per-project worker pools — projects cannot access each other's workers
 - Workers run as **non-root** user
 - Resource limits: memory cap, CPU cap, execution timeout
 - Read-only filesystem (except /tmp)
 - `--no-new-privileges` security option
-
-### Layer 5: Worker Pool Isolation
-
-- Each project gets its own set of containers
-- Separate Docker networks per project
-- Containers see only their project's secrets
-- No shared state between projects
 
 ### Security Boundary Summary
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Agent                             │
-│  • Never sees secrets                               │
+│  • Sees only opaque profile IDs (ark_...)           │
+│  • Never sees credential values                     │
 │  • Receives only sanitized output                   │
 │  • Owns LLM credentials (not Airlock)               │
 ├─────────────────────────────────────────────────────┤
-│                  Airlock API                         │
-│  • Routes requests to workers                       │
-│  • Manages execution lifecycle                      │
+│                  Airlock Server                      │
+│  • Serves web UI for credential/profile management  │
+│  • Routes execution requests to workers             │
+│  • Resolves profiles → credentials at runtime       │
 │  • Sanitizes all output before return               │
-│  • Holds project configs + secret references        │
+│  • Stores credentials encrypted                     │
 ├─────────────────────────────────────────────────────┤
-│              Worker Pool (per project)               │
-│  • Secrets as env vars (process-scoped)             │
+│              Execution Environment                   │
+│  • Credentials injected at runtime                  │
 │  • Allowlisted network only                         │
 │  • Non-root, resource-limited                       │
-│  • Isolated from other projects' workers            │
+│  • Sandboxed from host system                       │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -457,19 +497,19 @@ All output is scanned before being returned to the agent:
 ## Data Flow: Complete Execution
 
 ```
-Agent                    Airlock API               Worker Pool            External API
+Agent                    Airlock Server             Worker              External API
   │                          │                         │                       │
   │ POST /execute            │                         │                       │
-  │ {project, code,          │                         │                       │
-  │  settings, memory}       │                         │                       │
+  │ {profile_id: "ark_...", │                         │                       │
+  │  script: "..."}          │                         │                       │
   │─────────────────────────▶│                         │                       │
-  │                          │ find idle worker         │                       │
-  │                          │────────────────────────▶│                       │
-  │◀─────────────────────────│                         │                       │
-  │ 202 {execution_id}      │ POST /run                │                       │
-  │                          │ {code, settings, memory} │                       │
-  │                          │────────────────────────▶│                       │
-  │                          │                         │ requests.get(API_URL)  │
+  │                          │ resolve profile          │                       │
+  │                          │ → credentials: [A, B]    │                       │
+  │                          │                         │                       │
+  │                          │ inject creds → execute   │                       │
+  │◀─────────────────────────│────────────────────────▶│                       │
+  │ 202 {execution_id}      │                         │                       │
+  │                          │                         │ httpx.get(API_URL)     │
   │                          │                         │──────────────────────▶│
   │                          │                         │◀──────────────────────│
   │                          │                         │ data                   │
@@ -492,38 +532,8 @@ Agent                    Airlock API               Worker Pool            Extern
   │─────────────────────────▶│                         │                       │
   │◀─────────────────────────│                         │                       │
   │ {status: completed,      │                         │                       │
-  │  result: report,         │                         │                       │
-  │  memory_updates: {...}}  │                         │                       │
+  │  result: report}         │                         │                       │
   │                          │                         │                       │
-```
-
----
-
-## Project Configuration
-
-```yaml
-# projects/simphony-reports.yaml
-name: simphony-reports
-description: "Oracle Simphony revenue and sales reporting"
-
-secrets:
-  SIMPHONY_API_KEY: "${vault:simphony_api_key}"
-  SIMPHONY_BASE_URL: "https://api.simphony.oracle.com"
-  OPERA_API_KEY: "${vault:opera_api_key}"
-
-network_allowlist:
-  - "api.simphony.oracle.com"
-  - "api.opera.oracle.com"
-
-limits:
-  timeout: 60
-  memory_mb: 512
-  max_output_mb: 10
-
-packages:
-  - requests
-  - pandas
-  - openpyxl
 ```
 
 ---
@@ -532,7 +542,8 @@ packages:
 
 - **Multi-language workers**: Node.js, SQL execution
 - **Code caching**: Hash code, skip re-execution for identical requests
-- **Audit log**: Every execution logged with code, results, timing
-- **OpenClaw skill**: A SKILL.md that teaches any agent how to use Airlock
-- **Worker auto-scaling**: Scale replicas based on queue depth
+- **Tunnel integration (v2)**: ngrok/bore/cloudflare — one toggle in UI for public access
+- **Worker auto-scaling**: Scale workers based on queue depth
 - **Health checks**: Periodic liveness probes on workers, auto-restart unhealthy ones
+- **One-click deploy**: Render, Railway, Fly.io deploy buttons
+- **Profile templates**: Pre-built profile configurations for common use cases

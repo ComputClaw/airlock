@@ -6,12 +6,13 @@ Set up the project structure, dependencies, and a working FastAPI API server wit
 
 ## Architecture Context
 
-Airlock uses a **polling model**:
-1. Agent POSTs code → gets 202 with `execution_id`
+Airlock uses a **polling model** with **profile-based auth**:
+1. Agent POSTs code + profile_id → gets 202 with `execution_id`
 2. Agent polls `GET /executions/{id}` until terminal status
 3. If script needs LLM, status shows `awaiting_llm` → agent provides response via POST
+4. `GET /skill.md` returns dynamic skill document
 
-This spec implements the API skeleton with in-memory state and mock execution.
+Profile IDs (`ark_...`) are the sole authentication mechanism for the agent API.
 
 ## Tasks
 
@@ -21,8 +22,8 @@ Project metadata and dependencies:
 - fastapi
 - uvicorn[standard]
 - docker (docker-py SDK)
-- pyyaml
 - pydantic
+- cryptography (for Fernet credential encryption)
 - pytest (dev)
 - httpx (dev, for testing FastAPI)
 
@@ -32,11 +33,9 @@ Project metadata and dependencies:
 # --- Requests ---
 
 class ExecutionRequest(BaseModel):
-    project: str                          # Project identifier
-    code: str                             # Python code to execute
+    profile_id: str                       # ark_... profile ID (acts as auth)
+    script: str                           # Python code to execute
     timeout: int = 60                     # Max execution time (seconds)
-    settings: dict[str, str] = {}         # Non-secret settings
-    memory: dict[str, Any] = {}           # Current memory state
 
 class LLMResponse(BaseModel):
     response: str                         # LLM completion text
@@ -67,27 +66,7 @@ class ExecutionResult(BaseModel):
     stderr: str = ""
     error: str | None = None
     llm_request: LLMRequest | None = None # Present when status == awaiting_llm
-    memory_updates: dict[str, Any] = {}
     execution_time_ms: int | None = None
-
-class ProjectInfo(BaseModel):
-    name: str
-    description: str
-    status: str                           # "up" | "down"
-    replicas: int = 0
-    idle_workers: int = 0
-    packages: list[str] = []
-
-class ProjectList(BaseModel):
-    projects: list[ProjectInfo]
-
-class PoolRequest(BaseModel):
-    replicas: int = 1
-
-class PoolStatus(BaseModel):
-    name: str
-    status: str
-    replicas: int
 
 class HealthResponse(BaseModel):
     status: str = "ok"
@@ -95,13 +74,14 @@ class HealthResponse(BaseModel):
 
 ### 3. Create API Routes — `src/airlock/api.py`
 
-All endpoints, with in-memory state for tracking executions:
+All agent-facing endpoints, with in-memory state for tracking executions:
 
 #### `POST /execute` → 202
 
-- Generate a UUID execution_id
+- Validate profile_id starts with `ark_`
+- Generate a UUID execution_id (prefixed `exec_`)
 - Store in an in-memory dict with status `pending`
-- **Mock behavior**: immediately set status to `completed` with `result = {"echo": code}` and `stdout = code`
+- **Mock behavior**: immediately set status to `completed` with `result = {"echo": script}` and `stdout = script`
 - Return `ExecutionCreated`
 
 #### `GET /executions/{execution_id}` → 200
@@ -118,28 +98,11 @@ All endpoints, with in-memory state for tracking executions:
 - Return `ExecutionResult`
 - 404 if not found
 
-#### `GET /projects` → 200
+#### `GET /skill.md` → 200
 
-- Return `ProjectList` with one hardcoded example project:
-  ```python
-  ProjectInfo(
-      name="mock-project",
-      description="A mock project for testing",
-      status="up",
-      replicas=1,
-      idle_workers=1,
-      packages=["requests", "pandas"]
-  )
-  ```
-
-#### `POST /projects/{name}/up` → 200
-
-- Accept `PoolRequest` body
-- **Mock behavior**: return `PoolStatus(name=name, status="up", replicas=request.replicas)`
-
-#### `POST /projects/{name}/down` → 200
-
-- **Mock behavior**: return `PoolStatus(name=name, status="down", replicas=0)`
+- Return a plain text mock skill document
+- Content-Type: `text/markdown`
+- **Mock behavior**: return a template with placeholder instance URL and no profiles
 
 #### `GET /health` → 200
 
@@ -152,7 +115,7 @@ import uvicorn
 from airlock.api import app
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=9090)
 ```
 
 ### 5. Create Tests — `tests/test_api.py`
@@ -160,23 +123,25 @@ if __name__ == "__main__":
 Using `httpx.AsyncClient` with FastAPI's `TestClient`:
 
 - **test_health**: GET /health returns 200 with `{"status": "ok"}`
-- **test_execute_returns_202**: POST /execute returns 202 with execution_id
+- **test_execute_returns_202**: POST /execute with valid profile_id returns 202 with execution_id
+- **test_execute_requires_profile**: POST /execute without profile_id returns 422
 - **test_poll_execution**: POST /execute → GET /executions/{id} returns completed result
 - **test_poll_not_found**: GET /executions/nonexistent returns 404
 - **test_respond_requires_awaiting_llm**: POST /executions/{id}/respond on a completed execution returns 409
-- **test_projects_list**: GET /projects returns a list with at least one project
-- **test_project_up**: POST /projects/test/up returns status "up"
-- **test_project_down**: POST /projects/test/down returns status "down" with 0 replicas
+- **test_skill_md**: GET /skill.md returns text/markdown content
+- **test_execution_id_format**: execution_id starts with `exec_`
 
 ### 6. Create `.gitignore`
 
-Python defaults + `.env` + `secrets/` + `__pycache__/` + `.pytest_cache/` + `*.egg-info`
+Python defaults + `.env` + `__pycache__/` + `.pytest_cache/` + `*.egg-info` + `*.db`
 
 ## Acceptance Criteria
 
-- `python -m airlock` starts the server on port 8000
-- All seven endpoints respond correctly with proper status codes
+- `python -m airlock` starts the server on port 9090
+- All endpoints respond correctly with proper status codes
 - Full polling flow works: POST /execute → GET /executions/{id} → completed
+- Profile ID is required and validated on /execute
+- GET /skill.md returns markdown content
 - Tests pass with `pytest`
 - No Docker execution yet — all mock responses
 - Clean Pydantic models for every request/response type
@@ -186,3 +151,4 @@ Python defaults + `.env` + `secrets/` + `__pycache__/` + `.pytest_cache/` + `*.e
 - Keep it simple. This is the API skeleton.
 - The mock execute endpoint should immediately complete so we can test the full polling flow.
 - We'll add a separate mock for `awaiting_llm` status in a test helper so we can test the respond flow too.
+- Port is 9090 (web UI and agent API share the same port).
