@@ -538,6 +538,91 @@ Agent                    Airlock Server             Worker              External
 
 ---
 
+## Deployment & Migration
+
+### Zero-Console Deployment
+
+Getting started should **never** require a terminal. Three paths to deployment:
+
+#### 1. One-Click Cloud Deploy
+
+Deploy buttons for major platforms — user clicks, fills in app name, done:
+
+- **Render**: `render.yaml` blueprint in repo → "Deploy to Render" button
+- **Railway**: `railway.toml` → "Deploy on Railway" button
+- **Fly.io**: `fly.toml` → `flyctl deploy` (or agent-driven via Fly MCP)
+
+Each generates a public URL. User opens it, lands on the web UI, starts adding credentials.
+
+#### 2. Agent-Driven Deployment
+
+The agent deploys Airlock on the user's behalf using platform MCPs:
+
+```
+Agent reads static SKILL.md from GitHub
+  → Sees deployment instructions per platform
+  → Uses Render MCP / Railway API / Fly CLI to create app
+  → Gets public URL back
+  → Tells user: "Airlock is live at https://your-app.onrender.com — open it to add your credentials"
+  → Reads dynamic GET /skill.md from running instance
+  → Self-onboards with available profiles
+```
+
+The static SKILL.md includes platform-specific deployment payloads (render.yaml, Dockerfile reference, env vars) so agents can programmatically deploy without human intervention.
+
+#### 3. Docker (for power users)
+
+```bash
+docker run -p 9090:9090 -v airlock-data:/data ghcr.io/computclaw/airlock:latest
+```
+
+Still supported, still the simplest self-hosted option.
+
+### Database Export / Import
+
+The entire Airlock state lives in one SQLite file. Migration between hosts is a first-class feature:
+
+#### Export (Web UI only)
+
+Settings → Export → enter passphrase → download `.airlock` file
+
+- Dumps the full SQLite database, **encrypted** with AES-256 using the passphrase
+- Optional: selective export (specific profiles only)
+- **No API endpoint** — export is a human action, not an agent action
+
+#### Import (Web UI only)
+
+Settings → Import → upload `.airlock` file → enter passphrase → preview → confirm
+
+- Preview mode: shows what will be imported (profiles, credentials, history) before committing
+- Merge strategy: skip duplicates, or overwrite — user chooses
+- Restores profiles, credentials, execution history
+- **No API endpoint** — credentials should never flow through agent-accessible routes
+
+#### Why UI-Only?
+
+Export/import involves the raw credential database. This is the one thing agents should **never** be able to trigger — even with admin tokens. Keeping it browser-only means a human is always in the loop when secrets move between instances.
+
+#### Migration Flow
+
+```
+Local Docker instance
+  → Web UI: Settings → Export → enter passphrase → download .airlock file
+
+New cloud instance (Render, Railway, etc.)
+  → Web UI: Settings → Import → upload .airlock file → enter passphrase → preview → confirm
+  → All profiles, credentials, and history restored
+  → Agents using ark_ profile IDs continue working with zero changes
+```
+
+#### Auto-Backup
+
+- Optional scheduled encrypted snapshots to a mounted volume or S3-compatible storage
+- Configurable retention (keep last N backups)
+- One toggle in Settings
+
+---
+
 ## Future Considerations
 
 - **Multi-language workers**: Node.js, SQL execution
@@ -545,5 +630,4 @@ Agent                    Airlock Server             Worker              External
 - **Tunnel integration (v2)**: ngrok/bore/cloudflare — one toggle in UI for public access
 - **Worker auto-scaling**: Scale workers based on queue depth
 - **Health checks**: Periodic liveness probes on workers, auto-restart unhealthy ones
-- **One-click deploy**: Render, Railway, Fly.io deploy buttons
 - **Profile templates**: Pre-built profile configurations for common use cases
