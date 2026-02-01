@@ -36,20 +36,28 @@ Read these first:
 - **Language:** Python 3.12
 - **API framework:** FastAPI + uvicorn
 - **Database:** SQLite (credentials, profiles, executions, stats)
-- **Web UI:** Vanilla JS + HTML/CSS (served as static files from FastAPI) — keep it simple, no build step
-- **Container runtime:** Docker (single image)
+- **Web UI:** Svelte + Vite (build output served as static files from FastAPI)
+- **Container runtime:** Docker (multi-stage build: Node frontend + Python backend)
 - **Credential encryption:** Fernet (cryptography library)
 - **Tests:** pytest
 
 ### Web UI Approach
 
-The web UI should be **simple vanilla JS/HTML/CSS** served as static files. No React, no Svelte, no build step. Reasons:
-- Single Dockerfile with no frontend build stage
-- Easy to modify and debug
-- Minimal dependencies
-- The UI is a management tool, not a consumer app — it doesn't need to be fancy
+The web UI is built with **Svelte** (via Vite). Reasons:
+- Component-based — clean separation as UI grows (credentials, profiles, executions, settings)
+- Reactive state management without DOM manipulation boilerplate
+- Tiny bundle size, no virtual DOM overhead
+- Feels close to plain HTML — low learning curve
 
-If complexity grows beyond what vanilla JS handles well, consider Alpine.js or htmx as lightweight alternatives before reaching for a full framework.
+Frontend source lives in `ui/` at project root. Build output goes to `ui/dist/` and is served as static files by FastAPI.
+
+```bash
+cd ui && npm ci && npm run build   # → ui/dist/
+```
+
+Dockerfile uses a multi-stage build: Node stage builds the frontend, Python stage copies the output.
+
+Use `@claude-code-plugins/frontend-design` for UI design and polish.
 
 ## Code Style
 
@@ -64,31 +72,39 @@ If complexity grows beyond what vanilla JS handles well, consider Alpine.js or h
 ```
 airlock/
 ├── src/
-│   ├── airlock/
-│   │   ├── __init__.py
-│   │   ├── api.py           # FastAPI routes — agent-facing API
-│   │   ├── web.py           # FastAPI routes — web UI API (CRUD for credentials, profiles)
-│   │   ├── models.py        # Pydantic request/response models
-│   │   ├── db.py            # SQLite database layer
-│   │   ├── crypto.py        # Credential encryption/decryption
-│   │   ├── profiles.py      # Profile resolution (ark_ ID → credentials)
-│   │   ├── pool.py          # Worker pool management
-│   │   ├── router.py        # Request routing to idle workers
-│   │   ├── sanitizer.py     # Output secret redaction
-│   │   ├── skill.py         # Dynamic SKILL.md generation
-│   │   └── worker/          # Code that runs inside workers
-│   │       ├── server.py    # Worker FastAPI (/run endpoint)
-│   │       └── sdk.py       # Script SDK (settings, llm, set_result)
-│   └── ...
-├── static/                   # Web UI static files
-│   ├── index.html
-│   ├── app.js
-│   └── style.css
+│   └── airlock/
+│       ├── __init__.py
+│       ├── __main__.py       # Entry point
+│       ├── app.py            # FastAPI app factory
+│       ├── api/
+│       │   ├── health.py     # /health
+│       │   ├── agent.py      # Agent-facing routes (/execute, /executions, /skill.md)
+│       │   └── admin.py      # Admin routes (setup, login, CRUD)
+│       ├── models.py         # Pydantic request/response models
+│       ├── db.py             # SQLite database layer
+│       ├── auth.py           # Password setup, login, session tokens
+│       ├── crypto.py         # Credential encryption/decryption
+│       ├── worker_manager.py # Docker worker container lifecycle
+│       ├── sanitizer.py      # Output secret redaction
+│       ├── skill.py          # Dynamic SKILL.md generation
+│       └── worker/           # Code that runs inside workers
+│           ├── server.py     # Worker FastAPI (/run endpoint)
+│           └── sdk.py        # Script SDK (settings, llm, set_result)
+├── ui/                       # Svelte frontend (Vite)
+│   ├── src/
+│   │   ├── App.svelte
+│   │   ├── main.js
+│   │   └── lib/              # Components
+│   ├── public/
+│   ├── package.json
+│   ├── vite.config.js
+│   └── dist/                 # Build output (served by FastAPI)
 ├── tests/
 ├── specs/                    # Implementation tasks
 ├── docs/
 ├── SKILL.md                  # Static skill document (for GitHub / airlock.sh)
-├── Dockerfile                # Single container image
+├── Dockerfile                # Multi-stage: Node build + Python runtime
+├── Dockerfile.worker         # Worker container image
 ├── pyproject.toml
 └── README.md
 ```

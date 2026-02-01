@@ -4,27 +4,27 @@ Each phase produces a deployable artifact. You can `docker run` it after every p
 
 ---
 
-## Phase 1: Foundation
+## Phase 1: Foundation ✅
 
 **Goal:** Runnable container with admin auth and empty web UI shell.
 
 **Deliverables:**
 - FastAPI server on `:9090`
 - `GET /health` → `{"status": "ok"}`
-- Admin token generated on first boot, printed to console
+- First-visit password setup (no console token)
 - SQLite database initialized (empty tables for credentials, profiles, executions)
-- Web UI shell: login page + empty dashboard (static HTML/JS served by FastAPI)
-- `Dockerfile` + `docker-compose.yml`
+- Web UI shell: setup/login page + dashboard (Svelte + Vite, served as static files)
+- `Dockerfile` (multi-stage: Node frontend + Python backend) + `docker-compose.yml`
 - GitHub Actions CI: lint, test, build image on push
 - Volume mount for `/data` (SQLite persistence)
 
 **Testable:**
 - `docker run -p 9090:9090 airlock` → container starts
 - `curl localhost:9090/health` → 200
-- Open `localhost:9090` → login page → enter admin token → empty dashboard
-- Admin token visible in `docker logs`
+- Open `localhost:9090` → first visit: set password → dashboard
+- Subsequent visits: login with password → dashboard
 
-**Version:** `v0.1.0`
+**Version:** `v0.1.0` ✅
 
 ---
 

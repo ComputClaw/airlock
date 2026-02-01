@@ -55,7 +55,7 @@ A **profile** is scoped access to credentials:
 
 - **Opaque ID**: `ark_` + random string (e.g., `ark_7f3x9kw2m4...`)
 - The profile ID acts as both **identifier AND auth** for the API
-- User creates profiles in the web UI, selecting which credentials are included
+- Both agents and users can create profiles; agents add credential references, users fill in values and lock
 - Optional **expiration date** — auto-revokes after a set date
 - **Revocable** from the UI at any time
 - The agent only ever sees the profile ID — **never the credentials behind it**
@@ -63,14 +63,15 @@ A **profile** is scoped access to credentials:
 
 ### Web UI for Credential Management
 
-Airlock exposes a web UI on its HTTP port. When you deploy the container and open the IP in a browser, you get:
+Airlock exposes a web UI on its HTTP port. When you deploy the container and open the URL in a browser, you get:
 
-- **Login** — first boot generates an admin token printed to console
-- **Credential management** — add/edit/delete API credentials (stored encrypted)
-- **Profile creation** — create profiles with unique `ark_` IDs, select which credentials each profile can access
+- **First-visit setup** — first user sets an admin password (no console access needed)
+- **Credential management** — add/edit/delete API credentials (stored encrypted). Agents can create credential slots (name + description), users fill in values.
+- **Profile management** — profiles start **unlocked** (agent and user add credentials), user **locks** when ready for production. Locked profiles can execute.
 - **Expiration controls** — set optional expiration on profiles
 - **Execution history** — what ran, when, success/fail, duration
 - **Stats dashboard** — executions per profile, error rates, avg duration
+- **Export/import** — migrate your entire Airlock state between hosts (encrypted, UI-only)
 
 ### Agent-Facing API
 
@@ -133,8 +134,8 @@ The full journey from discovery to execution:
 2. Agent generates deploy instructions for user
    → "Run this Docker command" or one-click cloud deploy
 
-3. User deploys, opens web UI
-   → Adds API credentials, creates profiles (ark_...)
+3. User opens web UI
+   → Sets admin password (first visit), adds credential values, locks profiles
 
 4. Agent reads dynamic GET /skill.md from running instance
    → Sees available profiles, SDK reference, instance URL
