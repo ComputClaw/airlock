@@ -57,45 +57,139 @@ Users manage credentials and access through a **web UI**. Agents interact throug
 
 ---
 
-## Profile System — The Key Innovation
+## Credential & Profile System
 
-A **profile** is scoped access to credentials. It is the central concept that makes Airlock simple for both users and agents.
+### Credentials (Global Store)
 
-### What is a Profile?
+Credentials are shared, user-managed secrets. They exist independently of profiles.
 
 | Property | Description |
 |----------|-------------|
-| **ID** | `ark_` + random string (e.g., `ark_7f3x9kw2m4p...`) |
+| **Name** | Unique key name (e.g., `SIMPHONY_API_KEY`) |
+| **Value** | Encrypted at rest, only decrypted at execution time |
+| **Description** | What this credential is for |
+
+- **Only the user** can create, edit, or delete credentials (via web UI)
+- Agents **never** see credential values — only key names
+- Updating a credential value propagates to **all profiles** that reference it (rotate once, done)
+
+### Profiles
+
+A **profile** is scoped access to credentials. Agents create profiles, users fill in values and lock them.
+
+| Property | Description |
+|----------|-------------|
+| **ID** | `ark_` + random string (e.g., `ark_7f3x9kw2m4p`) |
 | **Auth** | The profile ID itself acts as the API authentication token |
-| **Credentials** | User selects which stored credentials this profile can access |
+| **State** | `unlocked` → `locked` (one-way) |
+| **Keys** | References to credentials (names only, never values) |
 | **Expiration** | Optional date after which the profile auto-revokes |
 | **Revocable** | Can be instantly revoked from the web UI |
 
-### Why Profiles?
+### Profile States: Unlocked → Locked
 
-- **Agent never sees credentials** — only the opaque `ark_` ID
-- **Scoped access** — different profiles can expose different credential subsets
-- **Permission levels** — one profile for read-only, another for admin
-- **Time-limited** — set expiration for temporary access
-- **Auditable** — every execution is tied to a specific profile
-- **Revocable** — instant revocation without rotating credentials
+**Unlocked** (setup phase — agent and user collaborate):
+- Agent or user can **add/remove key references**
+- User can **fill in credential values** for referenced keys
+- Profile **cannot be used for execution**
+- Agent can read: key names, descriptions, `value_exists` flags
 
-### Profile Lifecycle
+**Locked** (production — user activates):
+- **No structural changes** — keys cannot be added or removed
+- User can still **update credential values** (propagates to all profiles using that credential)
+- Profile **can be used for execution**
+- User can revoke or set expiration
+
+Keys can ONLY be added when the profile is unlocked. This applies to both agents and users.
+
+### Why This Model?
+
+- **Agent never sees credentials** — only opaque `ark_` IDs and key names
+- **Agent drives setup** — creates profile, declares what keys it needs, describes each one
+- **User controls secrets** — fills in values, reviews, locks when ready
+- **Shared credentials** — rotate a key once, every profile gets it
+- **Clear handoff** — unlocked = still setting up, locked = ready for production
+- **Auditable** — every execution tied to a specific profile
+
+### Agent API for Profiles
+
+#### Create Profile
+```
+POST /profiles
+{
+  "description": "Oracle reporting — read only"
+}
+
+→ 201 Created
+{
+  "profile_id": "ark_7f3x9kw2m4p",
+  "description": "Oracle reporting — read only",
+  "locked": false,
+  "keys": []
+}
+```
+
+#### Add Keys (unlocked only)
+```
+POST /profiles/ark_7f3x9kw2m4p/keys
+{
+  "keys": [
+    {"name": "SIMPHONY_API_KEY", "description": "Simphony REST API key"},
+    {"name": "DB_HOST", "description": "Oracle DB hostname"}
+  ]
+}
+
+→ 200 OK
+```
+
+#### Read Profile
+```
+GET /profiles/ark_7f3x9kw2m4p
+
+→ 200 OK
+{
+  "profile_id": "ark_7f3x9kw2m4p",
+  "description": "Oracle reporting — read only",
+  "locked": false,
+  "keys": [
+    {"name": "SIMPHONY_API_KEY", "description": "Simphony REST API key", "value_exists": true},
+    {"name": "DB_HOST", "description": "Oracle DB hostname", "value_exists": false}
+  ]
+}
+```
+
+#### Profile Lifecycle
 
 ```
-User creates profile in web UI
-  → Selects credentials: [SIMPHONY_API_KEY, OPERA_API_KEY]
-  → Sets description: "Read-only reporting access"
-  → Sets expiration: 2025-06-01 (optional)
-  → Gets profile ID: ark_7f3x9kw2m4p
+Agent creates profile (unlocked)
+  → Agent adds keys with descriptions
+  → Agent tells user: "Open Airlock, fill in 3 values, then lock the profile"
 
-Agent uses profile ID in API calls
-  → POST /execute {profile_id: "ark_7f3x9kw2m4p", script: "..."}
-  → Airlock resolves profile → injects selected credentials → executes
+User opens web UI
+  → Sees requested keys with agent's descriptions
+  → Fills in values (creates or links existing credentials)
+  → Reviews everything
+  → Hits Lock
 
-User revokes profile (optional)
-  → Profile ID immediately stops working
-  → Credentials remain intact for other profiles
+Agent polls profile
+  → Sees locked: true, all value_exists: true
+  → Starts executing code
+```
+
+#### Credential Sharing Example
+
+```
+Credentials (global)
+├── SIMPHONY_API_KEY = ••••••••
+├── OPERA_API_KEY = ••••••••
+└── DB_HOST = oracle.prod.local
+
+Profile "Oracle Reporting" (locked)        Profile "Oracle Admin" (locked)
+├── SIMPHONY_API_KEY → ✅                  ├── SIMPHONY_API_KEY → ✅  (same credential)
+└── DB_HOST → ✅                           ├── OPERA_API_KEY → ✅
+                                           └── DB_HOST → ✅          (same credential)
+
+User rotates SIMPHONY_API_KEY once → both profiles get the new value
 ```
 
 ---
@@ -263,7 +357,7 @@ docker run -p 9090:9090 -v airlock-data:/data ghcr.io/computclaw/airlock:latest
 
 #### `POST /execute`
 
-Submit code for execution. Authenticated by profile ID.
+Submit code for execution. Authenticated by profile ID. Profile must be **locked**.
 
 ```
 Request:
@@ -276,6 +370,7 @@ Request:
 Response: 202 Accepted
 {
   "execution_id": "exec_a1b2c3d4",
+  "poll_url": "https://airlock.example.com/executions/exec_a1b2c3d4",
   "status": "pending"
 }
 ```
