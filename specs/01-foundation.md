@@ -177,19 +177,16 @@ CREATE TABLE IF NOT EXISTS admin (
 
 ### 5. Admin Auth — `src/airlock/auth.py`
 
-- On first boot: generate admin token (`atk_` + 32 random alphanumeric chars)
-- Store hashed in `admin` table (key: `admin_token_hash`)
-- Print to console:
-  ```
-  ╔══════════════════════════════════════════════════════╗
-  ║  Airlock is running!                                 ║
-  ║  Admin token: atk_8f2k4m9x...                       ║
-  ║  Open http://localhost:9090 to configure              ║
-  ╚══════════════════════════════════════════════════════╝
-  ```
-- On subsequent boots: token already exists, print reminder to check logs or reset
-- Admin routes require `Authorization: Bearer atk_...` header
-- Middleware or dependency injection for admin auth on `/api/admin/*` routes
+- **First-visit password setup**: no console token. First user to open the web UI sets a password.
+- `is_setup_complete(db)` → checks if `admin_password_hash` exists in `admin` table
+- `setup_admin(db, password)` → hash password (SHA-256), store in DB, return session token (`atk_` + 32 random chars)
+- `login_admin(db, password)` → validate password, generate + store new session token, return it
+- Password minimum: 8 characters
+- Setup can only run once (409 if password already set)
+- Session tokens stored hashed in `admin` table (key: `session_token_hash`)
+- Admin routes require `Authorization: Bearer atk_...` header (session token from setup/login)
+- `require_admin` FastAPI dependency using `HTTPBearer(auto_error=False)` → 401 if missing/invalid
+- Startup banner just says "Open http://localhost:9090 to configure" — no token in logs
 
 ### 6. Agent API Routes — `src/airlock/api/agent.py`
 
@@ -227,32 +224,47 @@ All mock responses for now. Real implementation comes in Phase 4.
 
 Stubbed for Phase 2. All require admin auth.
 
-#### `GET /api/admin/credentials` → 200
+#### `GET /api/admin/status` → 200 (unauthenticated)
+- Returns `{"setup_required": true/false}`
+
+#### `POST /api/admin/setup` → 200
+- Body: `{"password": "..."}`
+- Only works once (409 if already set up)
+- Returns `{"token": "atk_..."}`
+
+#### `POST /api/admin/login` → 200
+- Body: `{"password": "..."}`
+- Returns `{"token": "atk_..."}`
+- 401 if wrong password
+
+#### `GET /api/admin/credentials` → 200 (authenticated)
 - Returns `[]` (empty list)
 
-#### `GET /api/admin/profiles` → 200
+#### `GET /api/admin/profiles` → 200 (authenticated)
 - Returns `[]` (empty list)
 
-#### `GET /api/admin/executions` → 200
+#### `GET /api/admin/executions` → 200 (authenticated)
 - Returns `[]` (empty list)
 
-#### `GET /api/admin/stats` → 200
+#### `GET /api/admin/stats` → 200 (authenticated)
 - Returns `{"total_executions": 0, "active_profiles": 0, "stored_credentials": 0}`
 
 ### 8. Web UI — `src/airlock/ui/`
 
 Static HTML/CSS/JS served by FastAPI's `StaticFiles`. Minimal but functional:
 
-**Login page** (`/`):
-- Clean centered form: "Enter admin token" + input + submit
-- On submit: store token in sessionStorage, redirect to dashboard
+**Login/Setup page** (`/`):
+- Checks `GET /api/admin/status` to determine which form to show
+- **First visit** (setup_required: true): password + confirm password form → `POST /api/admin/setup`
+- **After setup** (setup_required: false): password login form → `POST /api/admin/login`
+- Session token stored in `sessionStorage` (cleared on tab close)
 - Dark theme, clean typography
 
 **Dashboard** (`/dashboard`):
-- Sidebar nav: Credentials, Profiles, Executions, Stats, Settings
-- Main content area: "Welcome to Airlock" + summary cards (all showing 0)
-- Each nav item leads to an empty placeholder page with "Coming in Phase 2/3/4"
-- Token validation: redirect to login if no valid token
+- Sidebar nav: Overview, Credentials, Profiles, Executions, Stats, Settings
+- Main content area: summary cards (all showing 0)
+- Each nav item leads to an empty placeholder page with "Coming soon"
+- Token validation: redirect to login if no valid session token
 
 **Style:**
 - Dark mode (matches Airlock's security vibe)
@@ -317,6 +329,13 @@ Triggered on push to `main` and PRs:
 - `GET /skill.md` → 200 with `text/markdown` content type
 
 #### `tests/test_admin_auth.py`
+- `GET /api/admin/status` → setup_required: true on fresh instance
+- `POST /api/admin/setup` → creates admin, returns token
+- `POST /api/admin/setup` twice → 409
+- `POST /api/admin/setup` with short password → 409
+- `GET /api/admin/status` after setup → setup_required: false
+- `POST /api/admin/login` with correct password → 200 + token
+- `POST /api/admin/login` with wrong password → 401
 - `GET /api/admin/credentials` without token → 401
 - `GET /api/admin/credentials` with valid token → 200
 - `GET /api/admin/credentials` with invalid token → 401
@@ -339,19 +358,19 @@ build/
 
 ## Acceptance Criteria
 
-- [ ] `python -m airlock` starts server on :9090, prints admin token
-- [ ] `docker build .` succeeds
-- [ ] `docker run -p 9090:9090 airlock` → container starts, admin token in logs
-- [ ] `curl localhost:9090/health` → `{"status": "ok"}`
-- [ ] Full mock polling flow: `POST /execute` → `GET /executions/{id}` → completed
-- [ ] Profile ID validated (must start with `ark_`)
-- [ ] `GET /skill.md` returns markdown
-- [ ] Web UI: login with admin token → dashboard with empty placeholder pages
-- [ ] Admin API requires token, returns 401 without it
-- [ ] SQLite database created in `/data/` with all tables
-- [ ] Admin token persists across container restarts (volume mount)
-- [ ] GitHub Actions CI: lint + test + build all pass
-- [ ] All tests pass with `pytest`
+- [x] `python -m airlock` starts server on :9090
+- [x] `docker build .` succeeds
+- [x] `docker run -p 9090:9090 airlock` → container starts
+- [x] `curl localhost:9090/health` → `{"status": "ok"}`
+- [x] Full mock polling flow: `POST /execute` → `GET /executions/{id}` → completed
+- [x] Profile ID validated (must start with `ark_`)
+- [x] `GET /skill.md` returns markdown
+- [x] Web UI: first-visit password setup → login → dashboard with placeholder pages
+- [x] Admin API requires session token, returns 401 without it
+- [x] SQLite database created in `/data/` with all tables
+- [x] Password persists across container restarts (volume mount)
+- [x] GitHub Actions CI: lint + test + build configured
+- [x] 20 tests pass with `pytest`
 
 ## Notes for CC
 
