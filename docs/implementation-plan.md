@@ -30,21 +30,25 @@ Each phase produces a deployable artifact. You can `docker run` it after every p
 
 ## Phase 2: Credential Management
 
-**Goal:** Users can store and manage API credentials through the web UI.
+**Goal:** Users and agents can manage credential slots. Users set values through the web UI. Agents create slots and read metadata via API.
 
 **Deliverables:**
-- Credential CRUD in web UI (add, edit, delete, list)
+- **Web UI:** Credential CRUD (add with value, edit value, edit description, delete, list)
+- **Agent API:** `GET /credentials` (list all: name, description, `value_exists`), `POST /credentials` (create slots: name + description, no value)
 - Credentials encrypted at rest in SQLite (AES-256, key derived from instance secret)
 - Instance secret generated on first boot, stored in `/data/.secret`
 - Each credential: name, value (encrypted), description, created_at
 - Credential values never displayed in full after creation (masked in UI)
-- Internal API routes for UI only (not exposed to agents)
+- Values can ONLY be set/edited through the web UI, never through the agent API
 
 **Testable:**
-- Add credential "SIMPHONY_API_KEY" with value → stored encrypted in DB
-- List credentials → shows names + descriptions, values masked
-- Edit credential description → updates
-- Delete credential → gone
+- **Web UI:** Add credential "SIMPHONY_API_KEY" with value → stored encrypted in DB
+- **Web UI:** List credentials → shows names + descriptions, values masked
+- **Web UI:** Edit credential value → updates, all profiles using it get new value
+- **Web UI:** Delete credential → gone (fails if referenced by locked profile)
+- **Agent API:** `POST /credentials [{"name": "DB_HOST", "description": "Oracle DB hostname"}]` → slot created, `value_exists: false`
+- **Agent API:** `GET /credentials` → lists all credentials with `value_exists` flags
+- Agent cannot set or read credential values (no endpoint for it)
 - Restart container → credentials persist (volume mount)
 
 **Version:** `v0.2.0`
@@ -53,23 +57,33 @@ Each phase produces a deployable artifact. You can `docker run` it after every p
 
 ## Phase 3: Profile System
 
-**Goal:** Users can create profiles that grant scoped access to credentials.
+**Goal:** Users and agents can create and configure profiles. Users lock profiles through the web UI.
 
 **Deliverables:**
-- Profile CRUD in web UI
+- **Web UI:** Profile CRUD — create, add/remove credentials, lock, revoke, set expiration
+- **Agent API:**
+  - `GET /profiles` — list all profiles with lock state, credential list + `value_exists` flags
+  - `GET /profiles/{id}` — single profile detail
+  - `POST /profiles` — create profile (starts unlocked)
+  - `POST /profiles/{id}/credentials` — add credentials to unlocked profile
+  - `DELETE /profiles/{id}/credentials` — remove credentials from unlocked profile
 - Profile ID generation: `ark_` + 24 char random alphanumeric
-- Assign credentials to a profile (multi-select from stored credentials)
+- Profile states: **unlocked** (setup) → **locked** (production), one-way
+- Unlocked: agent and user can add/remove credential references
+- Locked: no structural changes, profile usable for execution
+- Only the user can lock a profile (via web UI)
 - Optional expiration date (auto-revoke after date)
-- Profile status: active / expired / revoked
 - Revoke button (instant, irreversible)
 - Copy profile ID to clipboard
-- Profile detail view: assigned credentials (names only), status, created_at, last_used
 
 **Testable:**
-- Create profile → get `ark_...` ID
-- Assign 2 credentials to profile → visible in detail view
-- Set expiration to yesterday → status shows "expired"
-- Revoke profile → status shows "revoked"
+- **Agent API:** `POST /profiles {"description": "Oracle reporting"}` → get `ark_...` ID, `locked: false`
+- **Agent API:** `POST /profiles/{id}/credentials {"credentials": ["SIMPHONY_API_KEY"]}` → credential added
+- **Agent API:** `GET /profiles/{id}` → shows credentials with `value_exists` flags
+- **Agent API:** Add credentials to locked profile → 409 (rejected)
+- **Web UI:** Lock profile → `locked: true`, now usable for execution
+- **Web UI:** Revoke profile → status shows "revoked", agent gets 401
+- **Agent API:** `GET /profiles` → lists all profiles with full metadata
 - Copy `ark_` ID → paste somewhere → correct
 
 **Version:** `v0.3.0`
@@ -82,9 +96,11 @@ Each phase produces a deployable artifact. You can `docker run` it after every p
 
 **Deliverables:**
 - `POST /execute` — submit code with `profile_id` + `script` + optional `timeout`
-- `GET /executions/{id}` — poll for status and results
-- Profile authentication: `ark_` ID validated, must be active + not expired
-- Worker pool: N pre-warmed Python subprocess workers (configurable, default 2)
+  - Returns `execution_id` + `poll_url` (full URL for load-balancer-safe polling)
+  - Profile must be **locked** to execute
+- `GET /executions/{id}` — poll for status and results (agents should use `poll_url`)
+- Profile authentication: `ark_` ID validated, must be locked + not expired/revoked
+- Docker-based worker pool: long-running worker containers per project, Airlock routes to idle workers
 - Secret injection: profile's credentials available via `settings.get(key)` and `settings.keys()`
 - `set_result(data)` SDK function for structured output
 - Execution timeout (default 60s, configurable per request)
@@ -93,11 +109,11 @@ Each phase produces a deployable artifact. You can `docker run` it after every p
 - Execution history visible in web UI (per-profile filtering)
 
 **Testable:**
-- `POST /execute {profile_id: "ark_...", script: "import math; set_result(math.pi)"}` → 202
-- `GET /executions/{id}` → `{status: "completed", result: 3.14159...}`
+- `POST /execute {profile_id: "ark_...", script: "import math; set_result(math.pi)"}` → 202 with `poll_url`
+- Poll `poll_url` → `{status: "completed", result: 3.14159...}`
 - Script using `settings.get("SIMPHONY_API_KEY")` → gets the real value
-- Invalid `ark_` ID → 401
-- Expired profile → 401
+- Unlocked profile → 409 (not ready)
+- Invalid/revoked/expired `ark_` ID → 401
 - Script exceeds timeout → `{status: "timeout"}`
 - Script raises exception → `{status: "error", error: "..."}`
 - Web UI shows execution history with timestamps, statuses, durations
