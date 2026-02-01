@@ -1,0 +1,13 @@
+.git
+docs
+specs
+*.db
+.env
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+dist
+build
+data
+.github

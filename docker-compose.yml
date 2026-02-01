@@ -1,0 +1,10 @@
+services:
+  airlock:
+    build: .
+    ports:
+      - "9090:9090"
+    volumes:
+      - airlock-data:/data
+
+volumes:
+  airlock-data:
