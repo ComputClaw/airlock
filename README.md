@@ -8,154 +8,217 @@
 
 AI agents are great at reasoning. They're terrible at holding secrets and doing math.
 
-**No serious company gives production credentials to an LLM.** Think about what that actually means: your Stripe API key, your database connection string, your Oracle auth token — flowing through model context windows, sitting in plaintext logs, one prompt injection away from exfiltration. The LLM hallucinates a weird API call? Congratulations, your production key is now in an error message somewhere. Compliance teams shut this down on sight, and they're right to. It's a non-starter for any real enterprise work.
+**No serious company gives production credentials to an LLM.** Your Stripe API key, your database connection string, your Oracle auth token — flowing through model context windows, sitting in plaintext logs, one prompt injection away from exfiltration. Compliance teams shut this down on sight, and they're right to.
 
-**Non-deterministic workflows don't work in business.** Your CFO asks "why is this number different from yesterday?" and you can't say "the AI felt different today." But that's exactly what happens when you put an LLM in the execution loop. It decides to parse the date differently. It rounds a number. It skips a row because it "seemed like a duplicate." Reports, pipelines, monitoring — they need to produce the same output given the same input. Every time. No exceptions. The moment you let an LLM make decisions about data, you lose that guarantee.
+**Non-deterministic workflows don't work in business.** Your CFO asks "why is this number different from yesterday?" and you can't say "the AI felt different today." Reports, pipelines, monitoring — they need to produce the same output given the same input. Every time.
 
 These aren't edge cases. They're the two walls that every AI-in-the-enterprise project hits.
 
 ## The Solution
 
-Airlock solves both problems at once.
+**Credentials stay in a trusted environment the agent can't see.** The agent gets an opaque profile key. Airlock resolves that to real credentials at runtime, injects them into the execution environment, and scrubs them from the output. The agent never sees, touches, or transmits a single secret.
 
-**Credentials stay in a trusted environment the agent can't see.** The agent gets an opaque profile ID. Airlock resolves that to real credentials at runtime, injects them into the execution environment, and scrubs them from the output before anything goes back. The agent never sees, touches, or transmits a single secret.
+**Execution is deterministic Python — not an LLM guessing its way through API calls.** The agent writes real code. `httpx.get()`, `pandas.DataFrame()`, actual Python that does exactly what it says. Same code, same data, same numbers.
 
-**Execution is deterministic Python — not an LLM guessing its way through API calls.** The agent writes real code. `httpx.get()`, `pandas.DataFrame()`, actual Python that does exactly what it says. Same code, same data, same numbers. If you want the AI to write a summary or add insights, it does that *at the end* — interpretation on top of deterministic data, not randomness in the middle of the pipeline.
-
-## How It Works
-
-```
-User deploys Airlock (single Docker container)
-        ↓
-Opens web UI → adds API credentials → creates profiles
-        ↓
-Agent reads GET /skill.md → discovers available profiles
-        ↓
-Agent POSTs code + profile_id to /execute
-        ↓
-Airlock runs code with profile's credentials injected
-  - Network: allowlisted hosts only
-  - Secrets: injected at runtime, never exposed
-  - Isolation: sandboxed execution environment
-        ↓
-If script calls llm.complete():
-  - Execution pauses
-  - Agent sees {status: "awaiting_llm", prompt: "..."}
-  - Agent runs LLM, POSTs response back
-  - Script resumes
-        ↓
-Sanitized results returned (secrets redacted)
-```
-
-## Key Concepts
-
-### Profiles — The Key Innovation
-
-A **profile** is scoped access to credentials:
-
-- **Opaque ID**: `ark_` + random string (e.g., `ark_7f3x9kw2m4...`)
-- The profile ID acts as both **identifier AND auth** for the API
-- Both agents and users can create profiles; agents add credential references, users fill in values and lock
-- Optional **expiration date** — auto-revokes after a set date
-- **Revocable** from the UI at any time
-- The agent only ever sees the profile ID — **never the credentials behind it**
-- Different profiles can expose different subsets of credentials (read-only vs admin)
-
-### Web UI for Credential Management
-
-Airlock exposes a web UI on its HTTP port. When you deploy the container and open the URL in a browser, you get:
-
-- **First-visit setup** — first user sets an admin password (no console access needed)
-- **Credential management** — add/edit/delete API credentials (stored encrypted). Agents can create credential slots (name + description), users fill in values.
-- **Profile management** — profiles start **unlocked** (agent and user add credentials), user **locks** when ready for production. Locked profiles can execute.
-- **Expiration controls** — set optional expiration on profiles
-- **Execution history** — what ran, when, success/fail, duration
-- **Stats dashboard** — executions per profile, error rates, avg duration
-- **Export/import** — migrate your entire Airlock state between hosts (encrypted, UI-only)
-
-### Agent-Facing API
-
-The API an agent interacts with is intentionally minimal:
-
-```
-POST /execute
-  {profile_id: "ark_7f3x...", script: "import httpx..."}
-  → 202 {execution_id: "exec_abc123"}
-
-GET /executions/{id}
-  → {status: "completed", result: {...}, stdout: "..."}
-
-POST /executions/{id}/respond
-  → (for LLM pause/resume)
-
-GET /skill.md
-  → Dynamic SKILL.md with available profiles and SDK reference
-```
-
-### Two-Layer SKILL.md
-
-- **Static SKILL.md** (on GitHub / airlock.sh): Explains what Airlock is, how to deploy it, how the API works. Any agent can read this before Airlock is even deployed.
-- **Dynamic `GET /skill.md`** (on running instance): Returns the actual instance URL, available profiles (ID + description + expiry), SDK reference. Agent reads this to self-onboard.
-
-## Distribution
-
-Single Docker image. No external dependencies.
+## Quick Start
 
 ```bash
 docker run -p 9090:9090 ghcr.io/computclaw/airlock:latest
 ```
 
-That's it. Open `http://localhost:9090` in your browser to configure.
+Open `http://localhost:9090` in your browser. That's it.
 
-- **SQLite** for state (credentials, profiles, execution history)
-- **Web UI** baked into the image
-- **No external dependencies**
-- **v1**: local network only
-- **v2**: optional tunnel integration (ngrok/bore/cloudflare) — one toggle in UI
+## How It Works
 
-### One-Click Deploy
+```
+┌─────────────────────────────────────────────────────────┐
+│  1. DEPLOY                                              │
+│     User runs Docker container, opens web UI            │
+│     Sets admin password on first visit                  │
+├─────────────────────────────────────────────────────────┤
+│  2. CREDENTIALS                                         │
+│     Agent creates credential slots (name + description) │
+│     User fills in actual values via web UI              │
+│     All values encrypted at rest (AES-256-GCM)          │
+├─────────────────────────────────────────────────────────┤
+│  3. PROFILES                                            │
+│     Agent or user creates a profile                     │
+│     Selects which credentials the profile can access    │
+│     User locks the profile → generates ark_ID:SECRET    │
+│     Key shown once, copy it, won't be shown again       │
+├─────────────────────────────────────────────────────────┤
+│  4. EXECUTE                                             │
+│     Agent sends code + HMAC hash + Bearer auth          │
+│     Airlock verifies identity + code integrity          │
+│     Injects credentials into sandboxed Python worker    │
+│     Returns sanitized results (secrets redacted)        │
+└─────────────────────────────────────────────────────────┘
+```
 
-Deploy to your favorite cloud platform:
+## Credentials
 
-- Render
-- Railway
-- Fly.io
+Agents and users collaborate to manage credentials:
+
+- **Agent creates slots** — defines what credentials are needed (name + description), e.g., "Stripe API Key", "Database URL"
+- **User fills values** — enters actual secrets via the web UI (never through the API)
+- **Encrypted at rest** — AES-256-GCM with a master key stored in the persistent volume
+- **Agent never sees values** — the API returns `value_exists: true/false`, never the actual secret
+- **Export/import** — migrate your entire Airlock state between hosts, encrypted with a user-chosen passphrase
+
+## Profiles
+
+A profile is scoped, authenticated access to a set of credentials:
+
+- **Two-part key:** `ark_ID:SECRET` — generated when the user locks the profile
+- **Auth flow:** Agent sends `Authorization: Bearer ark_ID` + `HMAC-SHA256(secret, script)` as a hash in the request body
+- **Code integrity:** The HMAC proves the script hasn't been tampered with in transit
+- **Lifecycle:** unlocked (configuring) → locked (production-ready) → revocable at any time
+- **Expiration:** optional expiry date, auto-revokes after
+- **Key regeneration:** rotate the key without recreating the profile
+- **Scoped access:** each profile only exposes selected credentials
+
+```
+Profile lifecycle:
+
+  CREATE → add credentials → LOCK → execute → REVOKE
+                                ↑         │
+                                └─────────┘
+                              (regenerate key)
+```
+
+## Deployment
+
+Single Docker image. No external dependencies.
+
+```bash
+# Standalone
+docker run -d -p 9090:9090 -v airlock_data:/data ghcr.io/computclaw/airlock:latest
+
+# Docker Compose
+docker compose up -d
+```
+
+The `-v airlock_data:/data` volume persists credentials, profiles, execution history, and the encryption master key across restarts.
+
+### Cloud Deploy
+
+One-click deploy to:
+
+- **Render** — persistent disk for `/data`
+- **Railway** — volume mount for `/data`
+- **Fly.io** — volume for `/data`
 
 _(Deploy buttons coming soon)_
 
-## Agent Self-Onboarding Flow
+### Requirements
 
-The full journey from discovery to execution:
+Agents can declare Python package requirements:
 
 ```
-1. Agent reads static SKILL.md from GitHub
-   → Discovers what Airlock is, how the API works
-
-2. Agent generates deploy instructions for user
-   → "Run this Docker command" or one-click cloud deploy
-
-3. User opens web UI
-   → Sets admin password (first visit), adds credential values, locks profiles
-
-4. Agent reads dynamic GET /skill.md from running instance
-   → Sees available profiles, SDK reference, instance URL
-
-5. Agent starts executing code with profile ID
-   → POST /execute {profile_id: "ark_...", script: "..."}
+POST /requirements
+{"packages": ["httpx", "pandas", "openpyxl"]}
 ```
+
+Packages are `pip install`'d in the running container and persisted in the database — automatically reinstalled on restart.
+
+## Agent Integration
+
+### Self-Onboarding
+
+Airlock is designed so agents can discover and onboard themselves:
+
+1. **Static SKILL.md** (GitHub / airlock.sh) — agent learns what Airlock is and how the API works
+2. **User deploys** — `docker run` or one-click cloud
+3. **Dynamic `GET /skill.md`** (running instance) — returns available profiles, SDK reference, instance URL
+4. **Agent starts executing** — `POST /execute` with profile auth
+
+### API Surface
+
+```
+# Agent endpoints (no admin auth needed)
+GET  /skill.md                        → Dynamic skill doc for self-onboarding
+GET  /credentials                     → List credential slots (no values)
+POST /credentials                     → Create credential slot
+GET  /profiles                        → List available profiles
+GET  /profiles/{id}                   → Profile details
+POST /profiles                        → Create a profile
+POST /profiles/{id}/credentials       → Add credential to profile
+DELETE /profiles/{id}/credentials     → Remove credential from profile
+POST /requirements                    → Install Python packages
+GET  /requirements                    → List installed packages
+POST /execute                         → Execute code (Bearer auth + HMAC)
+GET  /executions/{id}                 → Poll for results
+POST /executions/{id}/respond         → Resume LLM pause
+
+# Admin endpoints (session token from web UI login)
+POST /api/admin/profiles/{id}/lock    → Lock profile, returns ark_ID:SECRET
+POST /api/admin/profiles/{id}/revoke  → Revoke profile
+POST /api/admin/profiles/{id}/regenerate-key → Rotate key
+```
+
+### LLM Pause/Resume
+
+Scripts can call `llm.complete(prompt)` to pause execution and ask the agent for LLM reasoning:
+
+```python
+# Inside a script running in Airlock
+result = llm.complete("Summarize these Q4 numbers: " + json.dumps(data))
+```
+
+The execution pauses, the agent sees `{status: "awaiting_llm", prompt: "..."}`, runs the LLM, and posts the response back. Deterministic data processing + LLM interpretation, cleanly separated.
 
 ## Security Model
 
-- **Credentials never leave Airlock** — agents only see opaque profile IDs
+- **Credentials never leave Airlock** — agents only see opaque profile keys
+- **HMAC code integrity** — `HMAC-SHA256(secret, script)` proves code wasn't tampered with
+- **Encrypted storage** — AES-256-GCM, master key in persistent volume
 - **Output sanitization** — all output scanned for secrets before return
-- **Encrypted storage** — credentials stored encrypted in SQLite
 - **Profile scoping** — each profile only exposes selected credentials
-- **Expiration & revocation** — time-limited access, revocable instantly
-- **Network isolation** — code can only reach allowlisted hosts
-- **Sandboxed execution** — non-root, resource-limited, read-only filesystem
+- **Expiration & revocation** — time-limited access, instantly revocable
+- **Sandboxed execution** — non-root, resource-limited, isolated Python worker
+- **No TLS in v1** — rely on infrastructure (Render/Railway/Fly/nginx). Airlock focuses on what runs above the transport layer.
+
+## Architecture
+
+```
+┌────────────────────────────────┐
+│         Docker Container        │
+│                                 │
+│  ┌──────────┐   ┌───────────┐  │
+│  │ Svelte   │   │  Python   │  │
+│  │ Web UI   │   │  FastAPI  │  │
+│  │ (static) │   │  Backend  │  │
+│  └────┬─────┘   └─────┬─────┘  │
+│       │               │         │
+│       └───────┬───────┘         │
+│               │                 │
+│         ┌─────┴──────┐          │
+│         │   SQLite    │          │
+│         │  (encrypted │          │
+│         │   values)   │          │
+│         └─────┬──────┘          │
+│               │                 │
+│         /data volume            │
+│  (credentials, profiles,        │
+│   master key, history)          │
+└────────────────────────────────┘
+```
+
+Single Docker image, multi-stage build: Svelte frontend + Python FastAPI backend. Everything in one container.
 
 ## Status
 
-🚧 Under construction. Built by Martin Bundgaard and Comput.
+🚧 **Under active development.**
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+- ✅ Phase 1: Foundation (API, execution engine, web UI)
+- ✅ Phase 2: Docker execution (sandboxed Python workers)
+- ✅ Phase 3: Credential management (encrypted storage, agent/user collaboration)
+- 🔨 Phase 4: Profile system (two-part keys, HMAC auth, lock/revoke lifecycle)
+
+Built by [Martin Bundgaard](https://github.com/ComputClaw) and [Comput](https://comput.sh).
+
+## Docs
+
+- [Architecture](docs/architecture.md) — full system design
+- [Agent Guide](docs/agent-guide.md) — 8-step workflow from discovery to execution
+- [Specs](specs/) — detailed implementation specs for each phase
