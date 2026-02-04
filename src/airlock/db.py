@@ -10,6 +10,22 @@ DB_PATH = DATA_DIR / "airlock.db"
 
 _db: aiosqlite.Connection | None = None
 
+MIGRATIONS = [
+    "ALTER TABLE profiles ADD COLUMN key_id TEXT UNIQUE",
+    "ALTER TABLE profiles ADD COLUMN key_secret_encrypted BLOB",
+]
+
+
+async def run_migrations(db: aiosqlite.Connection) -> None:
+    """Run schema migrations, ignoring 'duplicate column' errors."""
+    for sql in MIGRATIONS:
+        try:
+            await db.execute(sql)
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+    await db.commit()
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS credentials (
     id TEXT PRIMARY KEY,
@@ -24,6 +40,8 @@ CREATE TABLE IF NOT EXISTS profiles (
     id TEXT PRIMARY KEY,
     description TEXT DEFAULT '',
     locked INTEGER DEFAULT 0,
+    key_id TEXT UNIQUE,
+    key_secret_encrypted BLOB,
     expires_at TEXT,
     revoked INTEGER DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -69,6 +87,7 @@ async def init_db() -> aiosqlite.Connection:
     await _db.execute("PRAGMA foreign_keys=ON")
     await _db.executescript(SCHEMA)
     await _db.commit()
+    await run_migrations(_db)
     return _db
 
 

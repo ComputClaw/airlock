@@ -3,12 +3,16 @@
 import hashlib
 import secrets
 import string
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import aiosqlite
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from airlock.crypto import decrypt_value
 from airlock.db import get_db
+from airlock.services.profiles import resolve_profile_by_key
 
 _bearer = HTTPBearer(auto_error=False)
 
@@ -104,3 +108,65 @@ async def require_admin(
         raise HTTPException(status_code=401, detail="Invalid or expired session token")
 
     return token
+
+
+# --- Profile authentication ---
+
+
+@dataclass
+class ProfileAuth:
+    """Result of successful profile authentication."""
+
+    profile_id: str
+    key_id: str
+    secret: str
+
+
+async def require_profile(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+) -> ProfileAuth:
+    """FastAPI dependency: authenticate via profile key_id in Bearer header.
+
+    Validates Bearer token is present, starts with ark_, profile exists,
+    is locked, not revoked, and not expired. Returns ProfileAuth with
+    decrypted secret for HMAC verification.
+    """
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Missing authentication token")
+
+    token = credentials.credentials
+    if not token.startswith("ark_"):
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+    db = await get_db()
+    profile = await resolve_profile_by_key(db, token)
+
+    if profile is None:
+        raise HTTPException(status_code=401, detail="Invalid profile key")
+
+    if not profile["locked"]:
+        raise HTTPException(status_code=401, detail="Profile is not locked")
+
+    if profile["revoked"]:
+        raise HTTPException(status_code=401, detail="Profile has been revoked")
+
+    if profile["expires_at"]:
+        expires = datetime.fromisoformat(profile["expires_at"])
+        if expires <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="Profile has expired")
+
+    master_key = request.app.state.master_key
+    secret = decrypt_value(profile["key_secret_encrypted"], master_key)
+
+    await db.execute(
+        "UPDATE profiles SET last_used_at = datetime('now') WHERE id = ?",
+        (profile["id"],),
+    )
+    await db.commit()
+
+    return ProfileAuth(
+        profile_id=profile["id"],
+        key_id=token,
+        secret=secret,
+    )

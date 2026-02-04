@@ -10,10 +10,14 @@ from pydantic import BaseModel
 
 
 class ExecutionRequest(BaseModel):
-    """Request to execute a Python script."""
+    """Request to execute a Python script.
 
-    profile_id: str  # ark_... profile ID (acts as auth)
+    Profile authentication is via Authorization: Bearer ark_... header.
+    The hash field proves code integrity via HMAC-SHA256(secret, script).
+    """
+
     script: str  # Python code to execute
+    hash: str  # HMAC-SHA256(secret, script) hex digest
     timeout: int = 60  # Max execution time (seconds)
 
 
@@ -128,3 +132,65 @@ class AgentCreateCredentialsResponse(BaseModel):
 
     created: list[str]
     skipped: list[str]
+
+
+# --- Profile Requests ---
+
+
+class CreateProfileRequest(BaseModel):
+    """Create a new profile (used by both admin and agent API)."""
+
+    description: str = ""
+
+
+class UpdateProfileRequest(BaseModel):
+    """Update profile description and/or expiration (admin only)."""
+
+    description: str | None = None
+    expires_at: str | None = None
+
+
+class ProfileCredentialsRequest(BaseModel):
+    """Add or remove credential references from a profile."""
+
+    credentials: list[str]
+
+
+# --- Profile Responses ---
+
+
+class CredentialRefResponse(BaseModel):
+    """Credential reference within a profile."""
+
+    name: str
+    description: str
+    value_exists: bool
+
+
+class ProfileResponse(BaseModel):
+    """Profile metadata (returned by most endpoints)."""
+
+    id: str
+    description: str
+    locked: bool
+    key_id: str | None = None
+    credentials: list[CredentialRefResponse] = []
+    expires_at: str | None = None
+    revoked: bool = False
+    created_at: str
+    updated_at: str | None = None
+
+
+class ProfileLockedResponse(BaseModel):
+    """Returned by lock and regenerate-key (includes full key, shown once)."""
+
+    id: str
+    description: str
+    locked: bool = True
+    key_id: str
+    key: str
+    credentials: list[CredentialRefResponse] = []
+    expires_at: str | None = None
+    revoked: bool = False
+    created_at: str
+    updated_at: str | None = None
