@@ -6,15 +6,24 @@ import logging
 import uuid
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
+from airlock.db import get_db
 from airlock.models import (
+    AgentCreateCredentialsRequest,
+    AgentCreateCredentialsResponse,
+    AgentCredentialInfo,
     ExecutionCreated,
     ExecutionRequest,
     ExecutionResult,
     ExecutionStatus,
     LLMResponse,
+)
+from airlock.services.credentials import (
+    create_credential,
+    list_credentials,
+    validate_credential_name,
 )
 
 if TYPE_CHECKING:
@@ -74,6 +83,49 @@ async def _run_execution(
                 "error": str(exc),
             }
         )
+
+
+@router.get("/credentials")
+async def agent_list_credentials() -> dict:
+    """List all credentials with metadata. Never returns values."""
+    db = await get_db()
+    creds = await list_credentials(db)
+    return {
+        "credentials": [
+            AgentCredentialInfo(
+                name=c["name"],
+                description=c["description"],
+                value_exists=c["value_exists"],
+            ).model_dump()
+            for c in creds
+        ]
+    }
+
+
+@router.post("/credentials", status_code=201, response_model=AgentCreateCredentialsResponse)
+async def agent_create_credentials(
+    body: AgentCreateCredentialsRequest, request: Request
+) -> AgentCreateCredentialsResponse:
+    """Create credential slots (name + description, no values)."""
+    db = await get_db()
+    master_key: bytes = request.app.state.master_key
+    created: list[str] = []
+    skipped: list[str] = []
+
+    for item in body.credentials:
+        try:
+            validate_credential_name(item.name)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        try:
+            await create_credential(db, item.name, item.description, None, master_key)
+            created.append(item.name)
+        except ValueError:
+            # Name already exists — skip silently
+            skipped.append(item.name)
+
+    return AgentCreateCredentialsResponse(created=created, skipped=skipped)
 
 
 @router.post("/execute", status_code=202, response_model=ExecutionCreated)

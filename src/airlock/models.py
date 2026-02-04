@@ -69,3 +69,62 @@ class HealthResponse(BaseModel):
     """Health check response."""
 
     status: str = "ok"
+
+
+# --- Credential Requests ---
+
+
+class AdminCreateCredentialRequest(BaseModel):
+    """Admin creates a credential with optional value."""
+
+    name: str
+    value: str | None = None
+    description: str = ""
+
+
+class AdminUpdateCredentialRequest(BaseModel):
+    """Admin updates a credential's value and/or description."""
+
+    value: str | None = None
+    description: str | None = None
+
+
+class AgentCreateCredentialItem(BaseModel):
+    """Single credential slot for agent batch creation."""
+
+    name: str
+    description: str = ""
+
+
+class AgentCreateCredentialsRequest(BaseModel):
+    """Agent creates credential slots (no values)."""
+
+    credentials: list[AgentCreateCredentialItem]
+
+
+# --- Credential Responses ---
+
+
+class AdminCredentialInfo(BaseModel):
+    """Credential metadata for admin API."""
+
+    name: str
+    description: str
+    has_value: bool
+    created_at: str
+    updated_at: str | None = None
+
+
+class AgentCredentialInfo(BaseModel):
+    """Credential metadata for agent API."""
+
+    name: str
+    description: str
+    value_exists: bool
+
+
+class AgentCreateCredentialsResponse(BaseModel):
+    """Result of agent batch credential creation."""
+
+    created: list[str]
+    skipped: list[str]

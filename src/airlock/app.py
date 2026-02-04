@@ -11,7 +11,9 @@ from fastapi.responses import FileResponse
 from airlock.api.admin import router as admin_router
 from airlock.api.agent import router as agent_router, set_worker_manager
 from airlock.api.health import router as health_router
+from airlock.crypto import get_or_create_master_key
 from airlock.db import close_db, init_db
+import airlock.db as _db_module
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,10 @@ UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui" / "dist"
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle: init DB, optionally start worker container."""
     await init_db()
+
+    # Load or generate encryption master key
+    master_key = get_or_create_master_key(_db_module.DATA_DIR)
+    app.state.master_key = master_key
 
     worker_manager = None
     worker_enabled = os.environ.get("AIRLOCK_WORKER_ENABLED", "true").lower() == "true"

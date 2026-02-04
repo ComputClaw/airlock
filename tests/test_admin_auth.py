@@ -67,7 +67,7 @@ async def test_admin_valid_token(client, admin_token):
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert resp.status_code == 200
-    assert resp.json() == []
+    assert resp.json() == {"credentials": []}
 
 
 async def test_admin_invalid_token(client, admin_token):
