@@ -1,5 +1,7 @@
 """Admin API routes: setup, login, and authenticated management endpoints."""
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -22,6 +24,7 @@ from airlock.models import (
     ProfileResponse,
     UpdateProfileRequest,
 )
+from airlock.services.executions import list_executions
 from airlock.services.credentials import (
     create_credential,
     delete_credential,
@@ -368,9 +371,63 @@ async def admin_delete_profile(profile_id: str) -> Response:
 
 
 @router.get("/executions", dependencies=[Depends(require_admin)])
-async def list_executions() -> list:
-    """List execution history."""
-    return []
+async def admin_list_executions(
+    profile_id: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """List all executions with optional filters."""
+    db = await get_db()
+    records = await list_executions(
+        db, profile_id=profile_id, status=status, limit=min(limit, 100), offset=offset
+    )
+    return {
+        "executions": [
+            {
+                "execution_id": r["id"],
+                "profile_id": r["profile_id"],
+                "status": r["status"],
+                "result": r["result"],
+                "stdout": r["stdout"],
+                "stderr": r["stderr"],
+                "error": r["error"],
+                "execution_time_ms": r["execution_time_ms"],
+                "created_at": r["created_at"],
+                "completed_at": r["completed_at"],
+            }
+            for r in records
+        ]
+    }
+
+
+@router.get("/executions/{execution_id}", dependencies=[Depends(require_admin)])
+async def admin_get_execution(execution_id: str) -> dict:
+    """Get full execution details including script."""
+    db = await get_db()
+    cursor = await db.execute(
+        """SELECT id, profile_id, script, status, result, stdout, stderr,
+                  error, execution_time_ms, created_at, completed_at
+           FROM executions WHERE id = ?""",
+        (execution_id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    return {
+        "execution_id": row["id"],
+        "profile_id": row["profile_id"],
+        "script": row["script"],
+        "status": row["status"],
+        "result": json.loads(row["result"]) if row["result"] else None,
+        "stdout": row["stdout"] or "",
+        "stderr": row["stderr"] or "",
+        "error": row["error"],
+        "execution_time_ms": row["execution_time_ms"],
+        "created_at": row["created_at"],
+        "completed_at": row["completed_at"],
+    }
 
 
 @router.get("/stats", dependencies=[Depends(require_admin)])

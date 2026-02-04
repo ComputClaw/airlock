@@ -69,6 +69,37 @@ class ExecutionResult(BaseModel):
     execution_time_ms: int | None = None
 
 
+class ExecutionSummary(BaseModel):
+    """Execution summary for list endpoints."""
+
+    execution_id: str
+    status: str
+    execution_time_ms: int | None = None
+    created_at: str
+    completed_at: str | None = None
+
+
+class ExecutionDetail(BaseModel):
+    """Full execution detail."""
+
+    execution_id: str
+    profile_id: str
+    status: str
+    result: Any | None = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str | None = None
+    execution_time_ms: int | None = None
+    created_at: str
+    completed_at: str | None = None
+
+
+class AdminExecutionDetail(ExecutionDetail):
+    """Admin execution detail (includes script)."""
+
+    script: str
+
+
 class HealthResponse(BaseModel):
     """Health check response."""
 

@@ -3,10 +3,24 @@
 import hashlib
 import hmac as hmac_mod
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from airlock.services.profiles import verify_script_hmac
+
+
+def _mock_worker_manager():
+    """Create a mock WorkerManager that returns completed status."""
+    mock = MagicMock()
+    mock.is_running.return_value = True
+    mock.execute = AsyncMock(return_value={
+        "status": "completed",
+        "result": None,
+        "stdout": "",
+        "stderr": "",
+    })
+    return mock
 
 
 def _compute_hmac(secret: str, script: str) -> str:
@@ -567,7 +581,8 @@ async def test_regenerate_old_key_fails(client, admin_token):
     assert resp.status_code == 401
 
 
-async def test_regenerate_new_key_works(client, admin_token):
+async def test_regenerate_new_key_works(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     profile = await _create_profile(client)
     await _lock_profile(client, admin_token, profile["id"])
 
@@ -711,7 +726,8 @@ async def test_execute_expired_profile(client, admin_token):
     assert resp.status_code == 401
 
 
-async def test_execute_correct_hmac(client, admin_token):
+async def test_execute_correct_hmac(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     profile_id, key_id, secret = await _create_and_lock_profile(client, admin_token)
     script = "result = 42"
     script_hash = _compute_hmac(secret, script)
@@ -787,7 +803,8 @@ def test_hmac_digest_length():
 # ============================================================
 
 
-async def test_credential_resolution_with_values(client, admin_token):
+async def test_credential_resolution_with_values(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     await _create_credential(client, admin_token, "CRED_A", "value_a")
     await _create_credential(client, admin_token, "CRED_B", "value_b")
     profile = await _create_profile(client)
@@ -808,7 +825,8 @@ async def test_credential_resolution_with_values(client, admin_token):
     assert resp.status_code == 202
 
 
-async def test_credential_resolution_missing_value(client, admin_token):
+async def test_credential_resolution_missing_value(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     # Create credential without value
     await _create_credential(client, admin_token, "NO_VAL")
     profile = await _create_profile(client)
@@ -830,7 +848,8 @@ async def test_credential_resolution_missing_value(client, admin_token):
     assert resp.status_code == 202
 
 
-async def test_profile_no_credentials_empty_settings(client, admin_token):
+async def test_profile_no_credentials_empty_settings(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     profile_id, key_id, secret = await _create_and_lock_profile(client, admin_token)
     script = "x=1"
     resp = await client.post(
@@ -846,7 +865,8 @@ async def test_profile_no_credentials_empty_settings(client, admin_token):
 # ============================================================
 
 
-async def test_future_expiration_succeeds(client, admin_token):
+async def test_future_expiration_succeeds(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     profile = await _create_profile(client)
     future = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()
     await client.put(
@@ -886,7 +906,8 @@ async def test_past_expiration_fails(client, admin_token):
     assert resp.status_code == 401
 
 
-async def test_null_expiration_always_valid(client, admin_token):
+async def test_null_expiration_always_valid(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     # Default is null expiration
     profile_id, key_id, secret = await _create_and_lock_profile(client, admin_token)
     script = "x=1"

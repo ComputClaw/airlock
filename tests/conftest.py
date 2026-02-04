@@ -19,14 +19,6 @@ def _reset_db_module():
     db._db = None
 
 
-@pytest.fixture(autouse=True)
-def _clear_executions():
-    """Clear in-memory executions and reset worker manager between tests."""
-    from airlock.api.agent import _executions, set_worker_manager
-    _executions.clear()
-    set_worker_manager(None)
-
-
 @pytest.fixture
 async def app(tmp_path):
     """Create a fresh app instance with a clean temp database."""

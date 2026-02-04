@@ -9,7 +9,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse
 
 from airlock.api.admin import router as admin_router
-from airlock.api.agent import router as agent_router, set_worker_manager
+from airlock.api.agent import router as agent_router
 from airlock.api.health import router as health_router
 from airlock.crypto import get_or_create_master_key
 from airlock.db import close_db, init_db
@@ -38,11 +38,12 @@ async def lifespan(app: FastAPI):
 
             worker_manager = WorkerManager()
             await worker_manager.start()
-        except Exception:
-            logger.warning("Failed to start worker container, falling back to mock mode")
+            logger.info("Worker container started")
+        except Exception as e:
+            logger.warning(f"Worker container failed to start: {e}")
             worker_manager = None
 
-    set_worker_manager(worker_manager)
+    app.state.worker_manager = worker_manager
 
     worker_status = "started" if worker_manager and worker_manager.is_running() else "mock mode"
 
@@ -58,7 +59,6 @@ async def lifespan(app: FastAPI):
 
     if worker_manager and worker_manager.is_running():
         await worker_manager.stop()
-    set_worker_manager(None)
     await close_db()
 
 

@@ -2,6 +2,7 @@
 
 import hashlib
 import hmac as hmac_mod
+from unittest.mock import AsyncMock, MagicMock
 
 
 def _compute_hmac(secret: str, script: str) -> str:
@@ -15,7 +16,6 @@ def _compute_hmac(secret: str, script: str) -> str:
 
 async def _create_and_lock_profile(client, admin_token):
     """Helper: create a profile, lock it, return (key_id, secret)."""
-    # Create profile via admin API
     resp = await client.post(
         "/api/admin/profiles",
         json={"description": "test profile"},
@@ -23,7 +23,6 @@ async def _create_and_lock_profile(client, admin_token):
     )
     profile_id = resp.json()["id"]
 
-    # Lock it
     resp = await client.post(
         f"/api/admin/profiles/{profile_id}/lock",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -34,7 +33,21 @@ async def _create_and_lock_profile(client, admin_token):
     return key_id, secret
 
 
-async def test_execute_valid_profile(client, admin_token):
+def _mock_worker_manager():
+    """Create a mock WorkerManager that returns completed status."""
+    mock = MagicMock()
+    mock.is_running.return_value = True
+    mock.execute = AsyncMock(return_value={
+        "status": "completed",
+        "result": {"echo": "hello"},
+        "stdout": "",
+        "stderr": "",
+    })
+    return mock
+
+
+async def test_execute_valid_profile(app, client, admin_token):
+    app.state.worker_manager = _mock_worker_manager()
     key_id, secret = await _create_and_lock_profile(client, admin_token)
     script = "print('hello')"
     script_hash = _compute_hmac(secret, script)
@@ -67,7 +80,9 @@ async def test_execute_missing_auth(client):
     assert response.status_code == 401
 
 
-async def test_poll_execution(client, admin_token):
+async def test_poll_execution(app, client, admin_token):
+    mock_worker = _mock_worker_manager()
+    app.state.worker_manager = mock_worker
     key_id, secret = await _create_and_lock_profile(client, admin_token)
     script = "print('hello')"
     script_hash = _compute_hmac(secret, script)
@@ -80,12 +95,18 @@ async def test_poll_execution(client, admin_token):
     )
     execution_id = create_resp.json()["execution_id"]
 
+    # Manually run background dispatch
+    from airlock.db import get_db
+    from airlock.api.agent import _dispatch_to_worker
+    db = await get_db()
+    await _dispatch_to_worker(db, mock_worker, execution_id, script, {}, 60)
+
     # Poll it
     poll_resp = await client.get(f"/executions/{execution_id}")
     assert poll_resp.status_code == 200
     data = poll_resp.json()
     assert data["status"] == "completed"
-    assert data["result"] == {"echo": "print('hello')"}
+    assert data["result"] == {"echo": "hello"}
 
 
 async def test_poll_missing_execution(client):
@@ -93,18 +114,26 @@ async def test_poll_missing_execution(client):
     assert response.status_code == 404
 
 
-async def test_respond_to_completed_execution(client, admin_token):
+async def test_respond_to_completed_execution(app, client, admin_token):
+    mock_worker = _mock_worker_manager()
+    app.state.worker_manager = mock_worker
     key_id, secret = await _create_and_lock_profile(client, admin_token)
     script = "print('hello')"
     script_hash = _compute_hmac(secret, script)
 
-    # Create an execution (mock immediately completes)
+    # Create an execution
     create_resp = await client.post(
         "/execute",
         json={"script": script, "hash": script_hash},
         headers={"Authorization": f"Bearer {key_id}"},
     )
     execution_id = create_resp.json()["execution_id"]
+
+    # Run the worker to set status to completed
+    from airlock.db import get_db
+    from airlock.api.agent import _dispatch_to_worker
+    db = await get_db()
+    await _dispatch_to_worker(db, mock_worker, execution_id, script, {}, 60)
 
     # Try to respond — should fail because status is 'completed', not 'awaiting_llm'
     respond_resp = await client.post(

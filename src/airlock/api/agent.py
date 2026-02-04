@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-import uuid
-from typing import TYPE_CHECKING
+import time
 
+import aiosqlite
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
@@ -19,7 +19,6 @@ from airlock.models import (
     CredentialRefResponse,
     ExecutionCreated,
     ExecutionRequest,
-    ExecutionResult,
     ExecutionStatus,
     LLMResponse,
     ProfileCredentialsRequest,
@@ -31,6 +30,12 @@ from airlock.services.credentials import (
     resolve_profile_credentials,
     validate_credential_name,
 )
+from airlock.services.executions import (
+    create_execution,
+    get_execution,
+    list_executions,
+    update_execution,
+)
 from airlock.services.profiles import (
     add_credentials,
     create_profile,
@@ -39,25 +44,11 @@ from airlock.services.profiles import (
     remove_credentials,
     verify_script_hmac,
 )
-
-if TYPE_CHECKING:
-    from airlock.worker_manager import WorkerManager
+from airlock.worker_manager import WorkerManager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-# In-memory execution storage
-_executions: dict[str, ExecutionResult] = {}
-
-# Worker manager (set by app lifespan, None = mock mode)
-_worker_manager: WorkerManager | None = None
-
-
-def set_worker_manager(wm: WorkerManager | None) -> None:
-    """Set (or clear) the worker manager used by the execute endpoint."""
-    global _worker_manager  # noqa: PLW0603
-    _worker_manager = wm
 
 
 def _profile_response(info: dict) -> ProfileResponse:
@@ -77,42 +68,40 @@ def _profile_response(info: dict) -> ProfileResponse:
     )
 
 
-async def _run_execution(
-    execution_id: str, script: str, settings: dict[str, str], timeout: int
+async def _dispatch_to_worker(
+    db: aiosqlite.Connection,
+    worker: WorkerManager,
+    execution_id: str,
+    script: str,
+    settings: dict[str, str],
+    timeout: int,
 ) -> None:
-    """Background task: run script via worker or fall back to mock."""
-    _executions[execution_id] = _executions[execution_id].model_copy(
-        update={"status": ExecutionStatus.running}
-    )
+    """Send script to Docker worker and persist results."""
+    await update_execution(db, execution_id, status="running")
 
+    start = time.monotonic()
     try:
-        if _worker_manager is not None and _worker_manager.is_running():
-            result = await _worker_manager.execute(script, settings, timeout)
-            status = ExecutionStatus(result["status"])
-            _executions[execution_id] = _executions[execution_id].model_copy(
-                update={
-                    "status": status,
-                    "result": result.get("result"),
-                    "stdout": result.get("stdout", ""),
-                    "stderr": result.get("stderr", ""),
-                    "error": result.get("error"),
-                }
-            )
-        else:
-            # Mock fallback: echo the script
-            _executions[execution_id] = _executions[execution_id].model_copy(
-                update={
-                    "status": ExecutionStatus.completed,
-                    "result": {"echo": script[:100]},
-                }
-            )
-    except Exception as exc:
-        logger.exception("Execution %s failed", execution_id)
-        _executions[execution_id] = _executions[execution_id].model_copy(
-            update={
-                "status": ExecutionStatus.error,
-                "error": str(exc),
-            }
+        result = await worker.execute(script, settings, timeout)
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+
+        await update_execution(
+            db,
+            execution_id,
+            status=result["status"],
+            result=result.get("result"),
+            stdout=result.get("stdout", ""),
+            stderr=result.get("stderr", ""),
+            error=result.get("error"),
+            execution_time_ms=elapsed_ms,
+        )
+    except Exception as e:
+        elapsed_ms = int((time.monotonic() - start) * 1000)
+        await update_execution(
+            db,
+            execution_id,
+            status="error",
+            error=str(e),
+            execution_time_ms=elapsed_ms,
         )
 
 
@@ -226,73 +215,135 @@ async def agent_remove_credentials(
 # --- Execution endpoints ---
 
 
-@router.post("/execute", status_code=202, response_model=ExecutionCreated)
+@router.post("/execute", status_code=202)
 async def execute(
     body: ExecutionRequest,
     raw_request: Request,
     background: BackgroundTasks,
     profile: ProfileAuth = Depends(require_profile),
-) -> ExecutionCreated:
-    """Accept a script for execution. Authenticated by profile key."""
+) -> dict:
+    """Submit a script for execution. Authenticated by profile key."""
     if not verify_script_hmac(profile.secret, body.script, body.hash):
         raise HTTPException(
             status_code=403,
             detail="Script hash verification failed — HMAC mismatch",
         )
 
-    execution_id = f"exec_{uuid.uuid4().hex}"
-    poll_url = f"/executions/{execution_id}"
-
-    _executions[execution_id] = ExecutionResult(
-        execution_id=execution_id,
-        status=ExecutionStatus.pending,
-    )
-
+    # Resolve credentials for the profile
     db = await get_db()
     master_key = raw_request.app.state.master_key
     settings = await resolve_profile_credentials(db, profile.profile_id, master_key)
 
-    background.add_task(
-        _run_execution, execution_id, body.script, settings, body.timeout
-    )
+    # Create execution record in SQLite
+    execution_id = await create_execution(db, profile.profile_id, body.script, body.timeout)
 
-    return ExecutionCreated(
-        execution_id=execution_id,
-        poll_url=poll_url,
-        status=ExecutionStatus.pending,
-    )
+    # Build poll_url (full URL for load-balancer safety)
+    base_url = str(raw_request.base_url).rstrip("/")
+    poll_url = f"{base_url}/executions/{execution_id}"
 
-
-@router.get("/executions/{execution_id}", response_model=ExecutionResult)
-async def get_execution(execution_id: str) -> ExecutionResult:
-    """Poll execution status."""
-    if execution_id not in _executions:
-        raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
-    return _executions[execution_id]
-
-
-@router.post("/executions/{execution_id}/respond", response_model=ExecutionResult)
-async def respond_to_execution(execution_id: str, response: LLMResponse) -> ExecutionResult:
-    """Provide an LLM response to a paused execution."""
-    if execution_id not in _executions:
-        raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
-
-    execution = _executions[execution_id]
-    if execution.status != ExecutionStatus.awaiting_llm:
+    # Check worker availability
+    worker: WorkerManager | None = raw_request.app.state.worker_manager
+    if worker is None or not worker.is_running():
+        await update_execution(db, execution_id, status="error", error="Worker not available")
         raise HTTPException(
-            status_code=409,
-            detail=f"Execution is '{execution.status.value}', not 'awaiting_llm'",
+            status_code=503,
+            detail="Execution engine is not available. Docker worker container is not running.",
         )
 
-    # Mock: complete with the LLM response
-    _executions[execution_id] = execution.model_copy(
-        update={
-            "status": ExecutionStatus.completed,
-            "result": {"llm_response": response.response},
-            "llm_request": None,
-        }
+    # Dispatch to worker in background
+    background.add_task(
+        _dispatch_to_worker, db, worker, execution_id, body.script, settings, body.timeout
     )
-    return _executions[execution_id]
+
+    return {
+        "execution_id": execution_id,
+        "poll_url": poll_url,
+        "status": "pending",
+    }
+
+
+@router.get("/executions")
+async def list_agent_executions(
+    request: Request,
+    profile: ProfileAuth = Depends(require_profile),
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """List executions for the authenticated profile."""
+    db = await get_db()
+    records = await list_executions(
+        db, profile_id=profile.profile_id, status=status, limit=min(limit, 100), offset=offset
+    )
+    return {
+        "executions": [
+            {
+                "execution_id": r["id"],
+                "status": r["status"],
+                "execution_time_ms": r["execution_time_ms"],
+                "created_at": r["created_at"],
+                "completed_at": r["completed_at"],
+            }
+            for r in records
+        ]
+    }
+
+
+@router.get("/executions/{execution_id}")
+async def get_execution_status(execution_id: str) -> dict:
+    """Poll execution status and results."""
+    db = await get_db()
+    record = await get_execution(db, execution_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    response: dict = {
+        "execution_id": record["id"],
+        "status": record["status"],
+    }
+
+    if record["status"] in ("completed", "error", "timeout"):
+        response["result"] = record["result"]
+        response["stdout"] = record["stdout"]
+        response["stderr"] = record["stderr"]
+        response["error"] = record["error"]
+        response["execution_time_ms"] = record["execution_time_ms"]
+
+    return response
+
+
+@router.post("/executions/{execution_id}/respond")
+async def respond_to_execution(execution_id: str, response: LLMResponse) -> dict:
+    """Provide an LLM response to a paused execution."""
+    db = await get_db()
+    record = await get_execution(db, execution_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Execution {execution_id} not found")
+
+    if record["status"] != ExecutionStatus.awaiting_llm.value:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Execution is '{record['status']}', not 'awaiting_llm'",
+        )
+
+    # Stub: complete with the LLM response (full implementation in Phase 6)
+    await update_execution(
+        db,
+        execution_id,
+        status="completed",
+        result={"llm_response": response.response},
+    )
+
+    updated = await get_execution(db, execution_id)
+    return {
+        "execution_id": updated["id"],
+        "status": updated["status"],
+        "result": updated["result"],
+        "stdout": updated["stdout"],
+        "stderr": updated["stderr"],
+        "error": updated["error"],
+        "execution_time_ms": updated["execution_time_ms"],
+    }
 
 
 @router.get("/skill.md", response_class=PlainTextResponse)
@@ -312,6 +363,7 @@ Include HMAC-SHA256(secret, script) as the `hash` field in the request body.
 
 - `POST /execute` — Submit a script for execution (Bearer auth + HMAC)
 - `GET /executions/{id}` — Poll execution status
+- `GET /executions` — List your executions (Bearer auth)
 - `POST /executions/{id}/respond` — Provide LLM response
 - `GET /profiles` — List all profiles
 - `POST /profiles` — Create a new profile
