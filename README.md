@@ -208,12 +208,9 @@ Single Docker image, multi-stage build: Svelte frontend + Python FastAPI backend
 
 ## Status
 
-🚧 **Under active development.**
+🚧 **Under active development — not yet feature complete.**
 
-- ✅ Phase 1: Foundation (API, execution engine, web UI)
-- ✅ Phase 2: Docker execution (sandboxed Python workers)
-- ✅ Phase 3: Credential management (encrypted storage, agent/user collaboration)
-- 🔨 Phase 4: Profile system (two-part keys, HMAC auth, lock/revoke lifecycle)
+Core functionality works (credentials, profiles, execution). Security hardening and production polish in progress.
 
 Built by [Martin Bundgaard](https://github.com/ComputClaw) and [Comput](https://comput.sh).
 
